@@ -1,0 +1,749 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>多摄像头同步回放 · 可视化调试</title>
+<style>
+  :root{--bg:#0f1115;--card:#1a1d24;--card2:#22262f;--line:#2e333d;--fg:#e6e8ec;--dim:#9aa0aa;
+        --orange:#ff6a2b;--green:#37c26a;--blue:#4a9eff;--red:#ff4d4f;--radius:12px}
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--fg);
+       font-family:-apple-system,BlinkMacSystemFont,"PingFang SC","Segoe UI",sans-serif;line-height:1.5}
+  header{padding:16px 20px;border-bottom:1px solid var(--line);
+         background:linear-gradient(180deg,#161922,transparent);display:flex;align-items:center;gap:16px;flex-wrap:wrap}
+  header h1{margin:0;font-size:19px;white-space:nowrap}
+  header h1 .mi{color:var(--orange)}
+  header .meta{color:var(--dim);font-size:12px;font-family:ui-monospace,monospace}
+  .btn{background:var(--card2);border:1px solid var(--line);color:var(--fg);border-radius:8px;
+       padding:6px 13px;font-size:13px;cursor:pointer;white-space:nowrap}
+  .btn:hover{border-color:var(--orange)}
+  .btn:disabled{opacity:.4;cursor:not-allowed}
+  .btn.primary{background:var(--orange);border-color:var(--orange);color:#fff;font-weight:600}
+  select{background:var(--card2);border:1px solid var(--line);color:var(--fg);border-radius:8px;padding:6px 8px;font-size:13px}
+  main{padding:16px 20px 24px}
+
+  /* 空态 / 载入区 */
+  #drop{border:2px dashed var(--line);border-radius:var(--radius);padding:44px 24px;text-align:center;color:var(--dim)}
+  #drop.over{border-color:var(--orange);background:rgba(255,106,43,.05)}
+  #drop h2{margin:0 0 8px;color:var(--fg);font-size:17px}
+  #drop code{background:var(--card2);padding:2px 6px;border-radius:4px;color:var(--orange);font-size:12px}
+  #drop p{margin:6px 0;font-size:13px}
+
+  /* 画面网格 */
+  #grid{display:grid;gap:12px;grid-template-columns:repeat(auto-fit,minmax(340px,1fr))}
+  .cam{background:var(--card);border:1px solid var(--line);border-radius:10px;overflow:hidden;position:relative}
+  .cam.idle{opacity:.42}
+  .cam.err{border-color:var(--red)}
+  .cam video{width:100%;display:block;background:#000;aspect-ratio:16/9;object-fit:contain}
+  .cam .bar{padding:7px 10px;font-size:12px;display:flex;justify-content:space-between;gap:8px;align-items:baseline}
+  .cam .nm{font-weight:600;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .cam .nm .k{display:inline-block;border-radius:4px;padding:0 5px;margin-right:6px;font-size:10px;font-weight:700;color:#fff}
+  .cam .nm .k.miot{background:var(--orange)}
+  .cam .nm .k.usb{background:var(--blue)}
+  .cam .tm{color:var(--dim);font-family:ui-monospace,monospace;white-space:nowrap}
+  .cam .tag{position:absolute;top:8px;left:8px;font-size:11px;padding:2px 7px;border-radius:5px;
+            background:rgba(0,0,0,.62);font-family:ui-monospace,monospace}
+  .cam .tag.wait{color:var(--dim)}
+  .cam .tag.live{color:var(--green)}
+  .cam .tag.end{color:var(--orange)}
+  .cam .warn{position:absolute;top:8px;right:8px;font-size:11px;padding:2px 7px;border-radius:5px;
+             background:rgba(0,0,0,.62);color:var(--orange);cursor:help}
+
+  /* 时间轴 */
+  #tl{margin-top:16px;background:var(--card);border:1px solid var(--line);border-radius:var(--radius);padding:12px 14px}
+  .tlhead{display:flex;align-items:center;gap:14px;flex-wrap:wrap;margin-bottom:10px}
+  .clock{font-family:ui-monospace,monospace;font-size:20px;font-weight:700;color:var(--orange)}
+  .clock .tot{color:var(--dim);font-size:14px;font-weight:400}
+  .hint{color:var(--dim);font-size:12px}
+  #lanes{position:relative;cursor:pointer;user-select:none;-webkit-user-select:none}
+  .ruler{position:relative;height:18px;border-bottom:1px solid var(--line);margin-bottom:4px}
+  .ruler i{position:absolute;top:0;font-size:10px;color:var(--dim);font-family:ui-monospace,monospace;transform:translateX(-50%)}
+  .ruler i::after{content:"";position:absolute;left:50%;top:13px;width:1px;height:5px;background:var(--line)}
+  .lane{position:relative;height:24px;margin:3px 0;display:flex;align-items:center;gap:8px}
+  .lane .lb{width:150px;flex:0 0 150px;font-size:11px;color:var(--dim);overflow:hidden;
+            text-overflow:ellipsis;white-space:nowrap;font-family:ui-monospace,monospace}
+  .lane .track{position:relative;flex:1;height:14px;background:var(--card2);border-radius:7px;overflow:hidden}
+  .lane .span{position:absolute;top:0;bottom:0;border-radius:7px}
+  .lane .span.miot{background:linear-gradient(90deg,rgba(255,106,43,.75),rgba(255,106,43,.45))}
+  .lane .span.usb{background:linear-gradient(90deg,rgba(74,158,255,.75),rgba(74,158,255,.45))}
+  #head{position:absolute;top:0;bottom:0;width:2px;background:var(--fg);pointer-events:none;z-index:3}
+  #head::before{content:"";position:absolute;top:-1px;left:-5px;width:12px;height:12px;
+                background:var(--fg);border-radius:50%}
+  /* 播放头只在轨道区横向定位：轨道左边界 = 标签宽 150 + gap 8 */
+  #headwrap{position:absolute;left:158px;right:0;top:0;bottom:0;pointer-events:none}
+  .offnote{font-size:11px;color:var(--dim);margin-top:8px;font-family:ui-monospace,monospace}
+  footer{padding:14px 20px;color:var(--dim);font-size:12px;border-top:1px solid var(--line)}
+  footer code{color:var(--orange)}
+</style>
+</head>
+<body>
+<header>
+  <h1><span class="mi">■</span> 多摄像头同步回放</h1>
+  <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+    <button class="btn primary" id="play" disabled>▶ 播放</button>
+    <button class="btn" id="bstep" disabled>⟨ 帧</button>
+    <button class="btn" id="fstep" disabled>帧 ⟩</button>
+    <select id="rate" disabled>
+      <option value="0.25">0.25×</option><option value="0.5">0.5×</option>
+      <option value="1">1×</option><option value="2">2×</option><option value="4" selected>4×</option>
+    </select>
+    <select id="atrack" disabled title="选一路音源跟随时间轴播放">
+      <option value="">🔇 静音</option>
+    </select>
+    <label class="hint"><input type="checkbox" id="loop" checked> 循环</label>
+    <button class="btn" id="reload">载入清单…</button>
+  </div>
+  <div class="meta" id="hmeta"></div>
+</header>
+
+<main>
+  <div id="drop">
+    <h2>载入一次同步录制的结果</h2>
+    <p>把 <code>manifest.json</code> 连同同目录的 <code>.mp4</code> 一起拖进来，或点下面的按钮多选。</p>
+    <p style="margin-top:14px"><button class="btn primary" id="pick">选择清单 + 视频文件</button></p>
+    <p style="margin-top:16px;font-size:12px">
+      也可以起个本地服务后带参数打开，免去每次选文件：<br>
+      <code>uv run serve_viewer.py</code> 然后访问
+      <code>localhost:8000/sync_viewer.html?m=sync_clips/&lt;时间戳&gt;/manifest.json</code><br>
+      别用 <code>python3 -m http.server</code>：它不返回 206 分片，视频能播但拖不动进度条。
+    </p>
+    <p style="font-size:12px">清单由 <code>multi_cam_recorder.py</code> 生成，含各路起点偏移，本页据此对齐。</p>
+  </div>
+
+  <div id="grid" hidden></div>
+
+  <div id="tl" hidden>
+    <div class="tlhead">
+      <div class="clock"><span id="cur">0.000</span><span class="tot"> / <span id="tot">0.000</span> s</span></div>
+      <div class="hint">点击或拖动下方时间轴同步定位 · 空格播放/暂停 · ←/→ 单帧 · Shift+←/→ 一秒</div>
+    </div>
+    <div id="lanes">
+      <div class="ruler" id="ruler"></div>
+      <div id="lanelist"></div>
+      <div id="headwrap"><div id="head" style="left:0"></div></div>
+    </div>
+    <div class="offnote" id="offnote"></div>
+  </div>
+</main>
+
+<footer>
+  链接参数：<code>?m=…&amp;t=31.787</code> 载入后直接定位到该时刻（也接受 <code>1:23.4</code> / <code>1:02:03</code>），
+  <code>&amp;rate=1</code> 指定倍速。<b>定位或暂停后地址栏会自动带上当前时刻</b>，复制即可分享到这一帧。<br>
+  时间基准：各路起点取自<b>同一主机时钟</b>（米家侧=首帧到达后端时刻，USB 侧=本机抓帧时刻），
+  播放时按各自 <code>start_offset_ms</code> 错开、并按 <code>playback_speed_ratio</code> 校正回放速度漂移。
+  水印时间来自各相机自身 RTC，仅秒级精度，不作为对齐依据。
+</footer>
+
+<input type="file" id="fi" multiple accept=".json,.mp4,.csv,.wav" hidden>
+<!-- 音轨：只留一个元素，换源时换 src。不给每路各建一个——同时放多轨只
+     会互相干扰，而调试时只需听其中一路。 -->
+<audio id="aud" preload="auto"></audio>
+
+<script>
+"use strict";
+
+// ── 状态 ────────────────────────────────────────────────────────────────────
+let SRC = [];           // {label,kind,offset(s),ratio,video,el,dur,warn,err}
+let total = 0;          // 全局时长(s) = max(offset + dur)
+let gt = 0;             // 全局时间(s)
+let refUnixMs = 0;      // 全局时间零点对应的主机墙钟（清单 reference_unix_ms）
+let playing = false;
+// 默认 4×：本页是调试用，一段动辄 60s、大多数时间没事发生，先快速过一遍找到
+// 感兴趣的段落再降速/单帧看才是常用节奏。注意与选择器里的 selected 保持一致。
+let rate = 4;
+let stepSec = 1 / 30;
+let lastTick = 0;
+let objectUrls = [];    // 需要在重载时回收
+let wantT = null;       // ?t= 指定的初始时刻（待元数据到齐后才能应用）
+let userTouched = false;  // 用户已自己操作过 → 不再用 URL 里的时刻覆盖他
+let ATRACKS = [];       // 音轨：{label,url,csvUrl,sampleRate,times:Float64Array,idx:Uint32Array}
+let aCur = null;        // 当前选中的音轨
+
+const $ = (id) => document.getElementById(id);
+const fmt = (s) => (s < 0 ? "0.000" : s.toFixed(3));
+
+// ── 载入 ────────────────────────────────────────────────────────────────────
+
+/** 从 File[] 里找 manifest 并按 basename 匹配视频，得到可播放的源列表。 */
+async function loadFromFiles(files) {
+  const arr = [...files];
+  const mf = arr.find((f) => f.name.endsWith("_manifest.json") || f.name.endsWith(".json"));
+  if (!mf) { alert("没找到 *_manifest.json，请把清单和视频一起选中。"); return; }
+  const text = await mf.text();
+  // 同名视频优先用 objectURL（file:// 下相对路径可能解析不到）
+  const byName = new Map(arr.filter((f) => f.name.endsWith(".mp4")).map((f) => [f.name, f]));
+  build(JSON.parse(text), byName);
+}
+
+async function loadFromUrl(url) {
+  const r = await fetch(url);
+  if (!r.ok) throw new Error(`HTTP ${r.status}`);
+  const m = await r.json();
+  // 清单里的 file 是相对仓库根的路径；把它按清单 URL 所在目录解析，
+  // 这样 ?m=sync_clips/x.json 和 ?m=/abs/x.json 两种写法都能找到视频。
+  build(m, null, url);
+}
+
+/** 把清单变成播放源。byName 有值时用 objectURL，否则用路径。 */
+function build(m, byName, manifestUrl) {
+  objectUrls.forEach(URL.revokeObjectURL);
+  objectUrls = [];
+  refUnixMs = Number(m.reference_unix_ms) || 0;
+  const rows = (m.sources || []).slice();
+  // 先按起点偏移排序，时间轴上更直观（最早的在最上面）
+  rows.sort((a, b) => (a.start_offset_ms ?? 1e9) - (b.start_offset_ms ?? 1e9));
+
+  SRC = rows.map((s) => {
+    const base = (s.file || "").split("/").pop();
+    let src = "";
+    if (s.file) {
+      if (byName && byName.has(base)) {
+        const u = URL.createObjectURL(byName.get(base));
+        objectUrls.push(u);
+        src = u;
+      } else if (manifestUrl) {
+        src = new URL(s.file.split("/").pop(),
+                      new URL(manifestUrl, location.href)).href;
+      } else {
+        src = s.file;   // 相对本页面
+      }
+    }
+    return {
+      label: s.label || base || "(未命名)",
+      kind: s.kind === "usb" ? "usb" : "miot",
+      offset: (s.start_offset_ms || 0) / 1000,
+      ratio: speedRatio(s),
+      // 逐帧时间戳 sidecar（仅 USB 有）：有它时做**精确帧映射**，不再用速度比。
+      // 必要性：速度比是平均值，而 UVC 相机的**瞬时**帧率会变（暗光下开头慢、
+      // 之后稳定），单一常数拟合不了 —— 实测残余偏差 10s处 70ms、30s处 204ms。
+      csvUrl: sidecarUrl(s, byName, manifestUrl),
+      fpsWritten: Number(s.fps_written) || (s.fps ? Math.round(Number(s.fps)) : 0),
+      frameTimes: null,          // Float64Array，异步载入后填
+      warn: s.warn || "",
+      err: s.error || "",
+      src, dur: 0, video: null, el: null,
+      res: s.size || "", fpsAct: s.fps_actual || null,
+    };
+  });
+
+  render(m);
+  buildAudioTracks(m, byName, manifestUrl);
+}
+
+/** 从清单的 audio 段建音轨列表，并填充选择器。 */
+function buildAudioTracks(m, byName, manifestUrl) {
+  ATRACKS = [];
+  aCur = null;
+  const sel = $("atrack");
+  sel.innerHTML = '<option value="">\uD83D\uDD07 静音</option>';
+  const aud = $("aud");
+  aud.pause();
+  aud.removeAttribute("src");
+
+  const rows = (m.audio || []).filter((a) => a.file && !a.error);
+  rows.forEach((a, i) => {
+    ATRACKS.push({
+      label: a.label || a.file,
+      url: resolveRef(a.file, byName, manifestUrl),
+      csvUrl: resolveRef(a.timestamps, byName, manifestUrl),
+      sampleRate: Number(a.sample_rate) || 48000,
+      times: null,        // 逐包主机墙钟
+      idx: null,          // 对应的起始采样号
+    });
+    const o = document.createElement("option");
+    o.value = String(i);
+    o.textContent = `\uD83D\uDD0A ${shortLabel(a.label || a.file)}`;
+    sel.appendChild(o);
+  });
+  sel.disabled = ATRACKS.length === 0;
+  if (!ATRACKS.length) {
+    sel.title = "本段录制没有音频（录制时未加 --audio）";
+    return;
+  }
+  sel.title = "选一路音源跟随时间轴播放";
+  loadAudioSidecars();
+}
+
+/** 拉取音轨的逐包时间戳（sample_index,unix_ms,n_samples）。 */
+async function loadAudioSidecars() {
+  await Promise.all(ATRACKS.map(async (t) => {
+    if (!t.csvUrl) return;
+    try {
+      const r = await fetch(t.csvUrl);
+      if (!r.ok) return;
+      const lines = (await r.text()).split("\n");
+      const ts = [], ix = [];
+      for (let i = 1; i < lines.length; i++) {
+        const c = lines[i].split(",");
+        if (c.length >= 2) {
+          const si = parseInt(c[0], 10), ms = parseFloat(c[1]);
+          if (!Number.isNaN(si) && !Number.isNaN(ms)) { ix.push(si); ts.push(ms); }
+        }
+      }
+      if (ts.length >= 5) {
+        t.times = Float64Array.from(ts);
+        t.idx = Uint32Array.from(ix);
+      }
+    } catch (_) { /* 无 sidecar 时退回线性估算 */ }
+  }));
+}
+
+/** 把清单里的引用解成可取地址（拖文件模式优先 objectURL）。 */
+function resolveRef(ref, byName, manifestUrl) {
+  if (!ref) return "";
+  const base = String(ref).split("/").pop();
+  if (byName && byName.has(base)) {
+    const u = URL.createObjectURL(byName.get(base));
+    objectUrls.push(u);
+    return u;
+  }
+  if (manifestUrl) return new URL(base, new URL(manifestUrl, location.href)).href;
+  return ref;
+}
+
+// ── 渲染 ────────────────────────────────────────────────────────────────────
+
+function render(m) {
+  const grid = $("grid"), lanes = $("lanelist");
+  grid.innerHTML = ""; lanes.innerHTML = "";
+
+  SRC.forEach((s, i) => {
+    const cam = document.createElement("div");
+    cam.className = "cam" + (s.err ? " err" : "");
+    const kindTag = `<span class="k ${s.kind}">${s.kind === "usb" ? "USB" : "米家"}</span>`;
+    if (s.err) {
+      cam.innerHTML = `<div style="aspect-ratio:16/9;display:flex;align-items:center;
+        justify-content:center;color:var(--red);font-size:13px;padding:12px;text-align:center">
+        录制失败：${esc(s.err)}</div>
+        <div class="bar"><span class="nm">${kindTag}${esc(s.label)}</span></div>`;
+    } else {
+      cam.innerHTML = `
+        <video muted preload="auto" playsinline></video>
+        <div class="tag wait">等待</div>
+        ${s.warn ? `<div class="warn" title="${esc(s.warn)}">速度偏差</div>` : ""}
+        <div class="bar">
+          <span class="nm">${kindTag}${esc(s.label)}</span>
+          <span class="tm">–</span>
+        </div>`;
+    }
+    grid.appendChild(cam);
+    s.el = cam;
+    if (!s.err) {
+      s.video = cam.querySelector("video");
+      s.video.src = s.src;
+      s.video.addEventListener("loadedmetadata", () => { s.dur = s.video.duration || 0; recalc(); }, { once: true });
+      s.video.addEventListener("error", () => {
+        s.err = "视频加载失败（路径不可达？把 mp4 一起选中，或用本地服务打开）";
+        render(m);
+      }, { once: true });
+    }
+
+    // 时间轴泳道
+    const lane = document.createElement("div");
+    lane.className = "lane";
+    lane.innerHTML = `<div class="lb" title="${esc(s.label)}">${esc(shortLabel(s.label))}</div>
+                      <div class="track"><div class="span ${s.kind}"></div></div>`;
+    lanes.appendChild(lane);
+    s.span = lane.querySelector(".span");
+  });
+
+  $("drop").hidden = true;
+  $("grid").hidden = false;
+  $("tl").hidden = false;
+  ["play", "bstep", "fstep", "rate"].forEach((id) => ($(id).disabled = false));
+
+  const okN = SRC.filter((s) => !s.err).length;
+  $("hmeta").textContent =
+    `${okN}/${SRC.length} 路 · 录于 ${(m.recorded_at || "").replace("T", " ").slice(0, 19)}` +
+    (m.alignment && m.alignment.max_offset_ms != null
+      ? ` · 最大起点差 ${Math.round(m.alignment.max_offset_ms)}ms` : "");
+  $("offnote").textContent = SRC.filter((s) => !s.err)
+    .map((s) => `${shortLabel(s.label)} 起点+${(s.offset * 1000).toFixed(0)}ms` +
+                (s.ratio !== 1 ? ` 速度×${s.ratio.toFixed(3)}` : ""))
+    .join("   ·   ");
+  recalc();
+  loadSidecars();
+}
+
+/** 逐帧时间戳 sidecar 的可取地址（拖文件模式优先用 objectURL）。 */
+function sidecarUrl(s, byName, manifestUrl) {
+  if (!s.frame_timestamps) return "";
+  const base = String(s.frame_timestamps).split("/").pop();
+  if (byName && byName.has(base)) {
+    const u = URL.createObjectURL(byName.get(base));
+    objectUrls.push(u);
+    return u;
+  }
+  if (manifestUrl) {
+    return new URL(base, new URL(manifestUrl, location.href)).href;
+  }
+  return s.frame_timestamps;
+}
+
+/** 拉取并解析 sidecar；失败不阻断，退回速度比模式。 */
+async function loadSidecars() {
+  await Promise.all(SRC.map(async (s) => {
+    if (!s.csvUrl || !s.fpsWritten) return;
+    try {
+      const r = await fetch(s.csvUrl);
+      if (!r.ok) return;
+      const lines = (await r.text()).split("\n");
+      const out = [];
+      for (let i = 1; i < lines.length; i++) {
+        const c = lines[i].split(",");
+        if (c.length >= 2) {
+          const v = parseFloat(c[1]);
+          if (!Number.isNaN(v)) out.push(v);
+        }
+      }
+      if (out.length >= 10) s.frameTimes = Float64Array.from(out);
+    } catch (_) { /* 置之不理，用速度比兜底 */ }
+  }));
+  const n = SRC.filter((s) => s.frameTimes).length;
+  if (n) {
+    $("offnote").textContent += `   ·   ${n} 路已启用逐帧精确对齐`;
+    syncAll(true);
+  }
+}
+
+function shortLabel(l) {
+  return l.replace(/^米家\s*/, "").replace(/^usb\[(\d+)\][\s]*/, "USB$1 ").slice(0, 22);
+}
+
+/** 该源的回放速度比 = 文件名义帧率 / 实际采集帧率。
+ *  >1 表示文件放得比现实快；用 currentTime = real/ratio 与 playbackRate = rate/ratio
+ *  两处一起校正。
+ *
+ *  不直接信清单里的 playback_speed_ratio：旧版录制工具把它算错了 —— 分子用的是
+ *  未取整的预热实测帧率，而文件实际是按取整后的帧率写的，于是时间轴随时长
+ *  累积偏移（实测：26.40→26 时 32s 处偏 0.5s，且偏的方向随四舍五入翻转）。
+ *  故优先用 fps_written / fps_actual 自行重算；旧清单无 fps_written 时用
+ *  round(fps) 还原写入值，这样旧素材也能得到正确对齐。 */
+function speedRatio(s) {
+  const act = Number(s.fps_actual);
+  const written = Number(s.fps_written) || (s.fps ? Math.round(Number(s.fps)) : 0);
+  if (act > 0 && written > 0) return written / act;
+  const r = Number(s.playback_speed_ratio);
+  return r > 0 ? r : 1;
+}
+function esc(s) {
+  return String(s).replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+}
+
+/** 把 ?t= 的值解成秒。接受 `31.787`、`1:23.4`（分:秒）、`1:02:03`（时:分:秒），
+ *  末尾可带 s。非法值返回 null（当作没传）而不是 0 —— 否则打错一个字就默默回到开头，
+ *  演示时很难发现。 */
+function parseTime(v) {
+  if (v == null) return null;
+  const str = String(v).trim().replace(/s$/i, "");
+  if (!str) return null;
+  const parts = str.split(":");
+  if (parts.length > 3 || parts.some((p) => p === "" || !Number.isFinite(Number(p)))) return null;
+  const secs = parts.reduce((acc, p) => acc * 60 + Number(p), 0);
+  return secs >= 0 ? secs : null;
+}
+
+/** 把当前时刻写回地址栏，拷走地址就能分享“跳到这一刻”的链接。
+ *
+ *  只在用户操作后调，**不能放进 `seek()`**：拖动时 pointermove 每帧都调 seek，
+ *  而 replaceState 被浏览器限流（Safari 约 30 秒 100 次），写多了会直接报错。 */
+function syncUrl() {
+  userTouched = true;
+  if (!(total > 0)) return;
+  try {
+    const u = new URL(location.href);
+    u.searchParams.set("t", gt.toFixed(3));
+    history.replaceState(null, "", u);
+  } catch (_) { /* file:// 等场景不支持，忽略 */ }
+}
+
+/** 元数据到齐后重算全局时长、泳道跨度、单帧步长与刻度。 */
+function recalc() {
+  const ok = SRC.filter((s) => !s.err && s.dur > 0);
+  if (!ok.length) return;
+  // 各路在全局轴上的占据区间：[offset, offset + dur*ratio]
+  // 乘 ratio 是把「文件时长」折回「真实时长」（文件放得快 → 真实更长）。
+  total = Math.max(...ok.map((s) => s.offset + s.dur * s.ratio));
+  $("tot").textContent = fmt(total);
+  const maxFps = Math.max(...ok.map((s) => s.fpsAct || 30));
+  stepSec = 1 / (maxFps || 30);
+  ok.forEach((s) => {
+    if (!s.span) return;
+    s.span.style.left = (s.offset / total * 100) + "%";
+    s.span.style.width = (s.dur * s.ratio / total * 100) + "%";
+  });
+  drawRuler();
+  // 元数据是逐路到的，total 会随之变大，所以 ?t= 要在**每次** recalc 重新应用（seek 内部
+  // 会夹到 [0,total]）；一旦用户自己动过就不再抢他的位置。
+  seek(wantT != null && !userTouched ? wantT : gt);
+}
+
+function drawRuler() {
+  const r = $("ruler");
+  r.innerHTML = "";
+  if (!(total > 0)) return;
+  // 目标 ~8 个刻度，取 0.5/1/2/5/10... 的“整数感”步长
+  const raw = total / 8;
+  const nice = [0.5, 1, 2, 5, 10, 15, 30, 60].find((n) => n >= raw) || 60;
+  for (let t = 0; t <= total + 1e-6; t += nice) {
+    const i = document.createElement("i");
+    // 刻度也只落在轨道区（左侧 158px 是标签占位）
+    i.style.left = `calc(158px + (100% - 158px) * ${t / total})`;
+    i.textContent = t.toFixed(nice < 1 ? 1 : 0) + "s";
+    r.appendChild(i);
+  }
+}
+
+// ── 同步核心 ────────────────────────────────────────────────────────────────
+
+/** 选中音轨在全局时刻 gt 应处的音频文件内时间；null = 该刻无声。
+ *
+ *  与视频同一套口径：先把 gt 换成主机墙钟，再二分查逐包时间戳拿采样号。
+ *  WAV 自身只有采样序，且丢包会让「采样号÷采样率」与真实时间脱钩，所以不能
+ *  直接拿 gt 当 currentTime。无 sidecar 时退回“首包起算的线性估算”。 */
+function audioLocalTime(t) {
+  if (!t) return null;
+  const targetMs = refUnixMs + gt * 1000;
+  if (t.times && t.times.length) {
+    const ts = t.times;
+    if (targetMs < ts[0] - 200 || targetMs > ts[ts.length - 1] + 1000) return null;
+    let lo = 0, hi = ts.length - 1;
+    while (hi - lo > 1) {
+      const mid = (lo + hi) >> 1;
+      if (ts[mid] <= targetMs) lo = mid; else hi = mid;
+    }
+    // 在包内按时间偏移插到采样级，避免只能对到包起点（米家侧一包 40ms）
+    const sample = t.idx[lo] + ((targetMs - ts[lo]) / 1000) * t.sampleRate;
+    return Math.max(0, sample / t.sampleRate);
+  }
+  return Math.max(0, gt);
+}
+
+/** 把音轨对到当前 gt。hard=true 时强制写 currentTime。 */
+function syncAudio(hard) {
+  const aud = $("aud");
+  if (!aCur) {
+    if (!aud.paused) aud.pause();
+    return;
+  }
+  const t = audioLocalTime(aCur);
+  if (t === null) {
+    if (!aud.paused) aud.pause();
+    return;
+  }
+  if (hard || Math.abs(aud.currentTime - t) > 0.25) {
+    try { aud.currentTime = t; } catch (_) { /* 尚未 seekable */ }
+  }
+  if (Math.abs(aud.playbackRate - rate) > 1e-3) {
+    try { aud.playbackRate = rate; } catch (_) {}
+  }
+  if (playing && aud.paused) aud.play().catch(() => {});
+  if (!playing && !aud.paused) aud.pause();
+}
+
+/** 某路在全局时刻 gt 应处的文件内时间；null = 该路此刻没有画面。 */
+function localTime(s) {
+  // 容差取该路一帧的时长：起点偏移只有几十毫秒时（本就是同步录制的常态），
+  // 第 0 帧就是最接近的可用帧，不该把卡片判成“未开始”并压暗。
+  const tol = 1 / (s.fpsAct || 20);
+
+  // 优先走逐帧精确映射：把全局时刻换成主机墙钟，二分找最贴近的帧，
+  // 再用 帧号/写入帧率 得到文件内位置。这样不依赖任何“平均帧率”假设。
+  if (s.frameTimes && refUnixMs) {
+    const targetMs = refUnixMs + gt * 1000;
+    const ft = s.frameTimes;
+    if (targetMs < ft[0] - tol * 1000) return null;
+    if (targetMs > ft[ft.length - 1] + tol * 1000) return null;
+    let lo = 0, hi = ft.length - 1;
+    while (hi - lo > 1) {
+      const mid = (lo + hi) >> 1;
+      if (ft[mid] <= targetMs) lo = mid; else hi = mid;
+    }
+    const idx = (targetMs - ft[lo] <= ft[hi] - targetMs) ? lo : hi;
+    const t = idx / s.fpsWritten;
+    return Math.min(Math.max(t, 0), Math.max(s.dur - 1e-3, 0));
+  }
+
+  const real = gt - s.offset;              // 该路自身已经过的真实时间
+  if (real < -tol) return null;            // 还没开始（差了不止一帧）
+  const t = real / s.ratio;                // 折成文件内时间
+  if (t > s.dur + tol) return null;        // 已结束
+  return Math.min(Math.max(t, 0), Math.max(s.dur - 1e-3, 0));
+}
+
+/** 把所有源对到当前 gt。hard=true 时强制写 currentTime（拖动/单帧）。 */
+function syncAll(hard) {
+  for (const s of SRC) {
+    if (s.err || !s.video) continue;
+    const t = localTime(s);
+    const tag = s.el.querySelector(".tag");
+    const tm = s.el.querySelector(".tm");
+    if (t === null) {
+      // 区间外：暂停并保持最后一帧，卡片压暗
+      if (!s.video.paused) s.video.pause();
+      s.el.classList.add("idle");
+      const before = gt < s.offset;
+      // 已结束的源要停在**自己的最后一帧**。光 pause 不够 —— 那只能靠「之前播/拖到过
+      // 那里」来留住画面；而用 ?t= 直接跳到超出该路末尾的时刻时它从未被 seek 过，
+      // 会停在第 0 帧却标着「已结束」，画面与状态互相矛盾。
+      if (!before && s.dur > 0 && s.video.currentTime < s.dur - 0.05) {
+        try { s.video.currentTime = Math.max(0, s.dur - 1e-3); } catch (_) { /* 尚未 seekable */ }
+      }
+      if (tag) { tag.className = "tag " + (before ? "wait" : "end"); tag.textContent = before ? "未开始" : "已结束"; }
+      if (tm) tm.textContent = before ? `+${((s.offset - gt) * 1000).toFixed(0)}ms 后开始` : "已结束";
+      continue;
+    }
+    s.el.classList.remove("idle");
+    if (tag) { tag.className = "tag live"; tag.textContent = playing ? "播放中" : "已定位"; }
+    if (tm) tm.textContent = `${t.toFixed(3)}s${s.res ? " · " + s.res : ""}`;
+
+    // 漂移校正：播放时只在偏差超阈值才写 currentTime，避免每帧 seek 造成卡顿
+    const drift = Math.abs(s.video.currentTime - t);
+    if (hard || drift > 0.15) {
+      try { s.video.currentTime = t; } catch (_) { /* 尚未 seekable */ }
+    }
+    // 文件回放偏快的源，用更慢的 playbackRate 抵消，避免播放中越跑越偏
+    const want = rate / s.ratio;
+    if (Math.abs(s.video.playbackRate - want) > 1e-3) {
+      try { s.video.playbackRate = want; } catch (_) {}
+    }
+    if (playing && s.video.paused) s.video.play().catch(() => {});
+    if (!playing && !s.video.paused) s.video.pause();
+  }
+  $("cur").textContent = fmt(gt);
+  const pct = total > 0 ? Math.min(gt / total, 1) * 100 : 0;
+  $("head").style.left = `calc(${pct}% - 1px)`;
+  syncAudio(hard);
+}
+
+function seek(t) {
+  gt = Math.min(Math.max(t, 0), total || 0);
+  syncAll(true);
+}
+
+function setPlaying(v) {
+  playing = v;
+  $("play").innerHTML = v ? "⏸ 暂停" : "▶ 播放";
+  if (v) {
+    if (total > 0 && gt >= total - 1e-3) gt = 0;   // 播完后再按 = 从头
+    lastTick = performance.now();
+    requestAnimationFrame(tick);
+  }
+  syncAll(!v);
+  if (!v) syncUrl();          // 暂停处就是想分享的那一刻，把它写回地址栏
+}
+
+function tick(now) {
+  if (!playing) return;
+  // 夹住单帧步长：rAF 在页面不可见时会被节流甚至暂停（实测切到后台就一直不回调），
+  // 回到前台时 now 与 lastTick 可能差几十秒，不夹住就会把播放头瞬间抛到末尾。
+  const dt = Math.min((now - lastTick) / 1000, 0.25);
+  lastTick = now;
+  gt += dt * rate;
+  if (total > 0 && gt >= total) {
+    if ($("loop").checked) { gt = 0; }
+    else { gt = total; setPlaying(false); return; }
+  }
+  syncAll(false);
+  requestAnimationFrame(tick);
+}
+
+// ── 交互 ────────────────────────────────────────────────────────────────────
+
+$("play").onclick = () => setPlaying(!playing);
+$("bstep").onclick = () => { setPlaying(false); seek(gt - stepSec); syncUrl(); };
+$("fstep").onclick = () => { setPlaying(false); seek(gt + stepSec); syncUrl(); };
+$("rate").onchange = (e) => { rate = parseFloat(e.target.value); syncAll(false); };
+$("atrack").onchange = (e) => {
+  const aud = $("aud");
+  const i = e.target.value === "" ? -1 : parseInt(e.target.value, 10);
+  aCur = i >= 0 ? ATRACKS[i] : null;
+  if (aCur) {
+    aud.src = aCur.url;
+    aud.load();
+    // 等元数据就绪再对位，否则 currentTime 写不进去
+    aud.addEventListener("loadedmetadata", () => syncAudio(true), { once: true });
+  } else {
+    aud.pause();
+    aud.removeAttribute("src");
+  }
+  syncAudio(true);
+};
+$("reload").onclick = () => $("fi").click();
+$("pick").onclick = () => $("fi").click();
+$("fi").onchange = (e) => { if (e.target.files.length) loadFromFiles(e.target.files); };
+
+// 时间轴拖动：按下即定位，拖动中连续跟随（pointer 事件同时覆盖鼠标/触摸）
+const lanes = $("lanes");
+let dragging = false;
+function posToTime(clientX) {
+  const box = lanes.getBoundingClientRect();
+  const left = box.left + 158;                    // 轨道起点（标签宽 + gap）
+  const w = box.right - left;
+  if (w <= 0) return 0;
+  return (clientX - left) / w * total;
+}
+lanes.addEventListener("pointerdown", (e) => {
+  if (!(total > 0)) return;
+  dragging = true;
+  lanes.setPointerCapture(e.pointerId);
+  setPlaying(false);
+  seek(posToTime(e.clientX));
+});
+lanes.addEventListener("pointermove", (e) => { if (dragging) seek(posToTime(e.clientX)); });
+lanes.addEventListener("pointerup", () => { if (dragging) syncUrl(); dragging = false; });
+lanes.addEventListener("pointercancel", () => { dragging = false; });
+
+document.addEventListener("keydown", (e) => {
+  if (!(total > 0) || e.target.tagName === "INPUT" || e.target.tagName === "SELECT") return;
+  if (e.code === "Space") { e.preventDefault(); setPlaying(!playing); }
+  else if (e.key === "ArrowLeft") { e.preventDefault(); setPlaying(false); seek(gt - (e.shiftKey ? 1 : stepSec)); syncUrl(); }
+  else if (e.key === "ArrowRight") { e.preventDefault(); setPlaying(false); seek(gt + (e.shiftKey ? 1 : stepSec)); syncUrl(); }
+  else if (e.key === "Home") { seek(0); syncUrl(); }
+  else if (e.key === "End") { seek(total); syncUrl(); }
+});
+
+// 拖放载入
+const drop = $("drop");
+["dragenter", "dragover"].forEach((ev) =>
+  document.addEventListener(ev, (e) => { e.preventDefault(); drop.classList.add("over"); }));
+["dragleave", "drop"].forEach((ev) =>
+  document.addEventListener(ev, (e) => { e.preventDefault(); drop.classList.remove("over"); }));
+document.addEventListener("drop", (e) => {
+  if (e.dataTransfer && e.dataTransfer.files.length) loadFromFiles(e.dataTransfer.files);
+});
+window.addEventListener("resize", drawRuler);
+
+// URL 参数：?m=<清单地址> 自动载入（需经 http 打开；file:// 下 fetch 会被拦，退回选文件）
+//         ?t=<时刻>  载入后直接定位（演示用：链接发出去就是那一帧）
+//         ?rate=<倍速> 覆盖默认 4×（演示常需 1×）
+const P = new URLSearchParams(location.search);
+wantT = parseTime(P.get("t"));
+
+const wantRate = parseFloat(P.get("rate"));
+if (Number.isFinite(wantRate) && wantRate > 0 && wantRate <= 8) {
+  rate = wantRate;
+  const rsel = $("rate");
+  // 传了选单里没有的倍速（如 1.5）就临时添一项，否则下拉框会显示成另一个值、
+  // 与实际播放速度不一致（这次 4× 默认值就是这么踩过的）。
+  if (![...rsel.options].some((o) => parseFloat(o.value) === wantRate)) {
+    const o = document.createElement("option");
+    o.value = String(wantRate);
+    o.textContent = wantRate + "×";
+    rsel.appendChild(o);
+  }
+  rsel.value = String(wantRate);
+}
+
+const q = P.get("m");
+if (q) {
+  loadFromUrl(q).catch((err) => {
+    $("drop").insertAdjacentHTML("afterbegin",
+      `<p style="color:var(--red)">自动载入 ${esc(q)} 失败：${esc(err.message)}
+       ——若是用 file:// 打开的，浏览器会拦住读取 JSON，请改用本地服务或手动选文件。</p>`);
+  });
+}
+</script>
+</body>
+</html>

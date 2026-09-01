@@ -1,0 +1,17 @@
+# 录制产物：体积大，且清单里含设备 did 与家庭内机位名
+sync_clips/
+
+# 早期复盘笔记：环境表里有真实米家设备 did 与家庭房间名，本仓库是公开的，
+# 故只留本地。要放对外文档就在 docs/ 下新建，这条规则不挡别的文件。
+docs/2026-08-23_multicam_sync.md
+
+.venv/
+__pycache__/
+*.pyc
+.ruff_cache/
+
+# 标定与调试过程中落下的取帧图 / 日志
+*.mp4
+*.wav
+verify_frame.jpg
+cam_*.jpg

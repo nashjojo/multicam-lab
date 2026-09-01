@@ -1,0 +1,27 @@
+[project]
+name = "multicam-lab"
+version = "0.1.0"
+description = "多机位（视野不重叠）同步录制 / 延迟标定 / 回放查看，用于制作跨镜头物品追踪数据集"
+readme = "README.md"
+requires-python = ">=3.11"
+
+# 录制主路径（USB 摄像头 + 录音）与录后校验所需。米家摄像头是可选能力，
+# 走 HTTP/WS 访问 miloco 后端，只用标准库，故不体现在这里。
+dependencies = [
+  "opencv-python>=4.8",
+  "av>=13",
+  "numpy>=1.26",
+  "sounddevice>=0.5",
+  "websockets>=13",
+  # 本机摄像头名称枚举（system_profiler 之外的兜底），仅 macOS 有
+  "pyobjc-framework-AVFoundation>=10; sys_platform == 'darwin'",
+]
+
+# 依赖装在项目环境里，但本项目自身是一组平铺脚本、不作为包安装。
+[tool.uv]
+package = false
+
+[tool.ruff]
+[tool.ruff.lint]
+select = ["E", "F", "I"]
+ignore = ["E501"]

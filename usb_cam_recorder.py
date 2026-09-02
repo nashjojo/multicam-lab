@@ -49,7 +49,10 @@ def macos_camera_names():
 
 
 def avfoundation_devices():
-    """用与 OpenCV 完全相同的方式枚举摄像头，返回 (名字列表, 是否严格一致)。
+    """用与 OpenCV 完全相同的方式枚举摄像头，返回 ([(名字, uniqueID)], 是否严格一致)。
+
+    名字与 uniqueID 必须同一次枚举一并取回：分两次枚举的话，中间插拔一下
+    两份列表就不同长也不同序，拼起来就是错位的设备身份。
 
     OpenCV 5.x 的 AVFoundation 后端：先用 [AVCaptureDevice devicesWithMediaType:]
     取视频设备列表，再按 uniqueID 升序排序（保证顺序跨启动稳定）。本函数
@@ -66,7 +69,8 @@ def avfoundation_devices():
     try:
         devices = list(AVCaptureDevice.devicesWithMediaType_("vide"))  # AVMediaTypeVideo
         devices.sort(key=lambda d: str(d.uniqueID()))  # 与 OpenCV 相同的排序键
-        return [str(d.localizedName()) for d in devices], True
+        return [(str(d.localizedName()), str(d.uniqueID()))
+                for d in devices], True
     except Exception:
         pass
     # 兜底：devicesWithMediaType 属 deprecated API，未来系统若移除，退回
@@ -78,19 +82,32 @@ def avfoundation_devices():
             "vide",
             0,
         )
-        return [str(d.localizedName()) for d in session.devices()], False
+        return [(str(d.localizedName()), str(d.uniqueID()))
+                for d in session.devices()], False
     except Exception:
         return [], False
 
 
+def camera_entries_for_index():
+    """返回 ([(设备名, uniqueID 或 None)], 来源说明)。
+
+    uniqueID 只有 AVFoundation 路径才有；system_profiler 兜底时为 None。它是
+    设备的稳定标识（跟着物理设备走，不随索引变），给自带麦克风的精确
+    配对用（见 mac_device_ids.mic_by_camera_uid）。
+    """
+    entries, exact = avfoundation_devices()
+    if entries:
+        if exact:
+            return entries, "AVFoundation（复现 OpenCV 的枚举+排序，与索引严格一致）"
+        return entries, "AVFoundation discovery session（未排序，仅供参考）"
+    return ([(n, None) for n in macos_camera_names()],
+            "system_profiler（顺序不可靠，仅供参考）")
+
+
 def camera_names_for_index():
     """返回 (设备名列表, 来源说明)。优先 AVFoundation（与索引严格一致）。"""
-    names, exact = avfoundation_devices()
-    if names:
-        if exact:
-            return names, "AVFoundation（复现 OpenCV 的枚举+排序，与索引严格一致）"
-        return names, "AVFoundation discovery session（未排序，仅供参考）"
-    return macos_camera_names(), "system_profiler（顺序不可靠，仅供参考）"
+    entries, source = camera_entries_for_index()
+    return [n for n, _ in entries], source
 
 
 def open_camera(index):

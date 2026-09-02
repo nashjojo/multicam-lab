@@ -214,15 +214,24 @@ def miot_worker(
 
 def usb_device_names() -> list[str]:
     """本机摄像头名列表（顺序与 OpenCV 索引一致）；不可用时返回空表。"""
+    return usb_device_entries()[0]
+
+
+def usb_device_entries() -> tuple[list[str], list[str | None]]:
+    """一次枚举取回 (名字列表, uniqueID 列表)，两者按 OpenCV 索引对齐。
+
+    uniqueID 给 :func:`resolve_cam_mics` 按 USB 身份精确配麦用；取不到时为
+    None，配对逻辑自动退回名字匹配。
+    """
     try:
-        from usb_cam_recorder import camera_names_for_index
+        from usb_cam_recorder import camera_entries_for_index
     except Exception:
-        return []
+        return [], []
     try:
-        names, _ = camera_names_for_index()
-        return names
+        entries, _ = camera_entries_for_index()
     except Exception:
-        return []
+        return [], []
+    return [n for n, _ in entries], [u for _, u in entries]
 
 
 # 连续互通设备（iPhone/iPad 充当摄像头、"桌上视角"）不自动带上：会唤醒手机，
@@ -482,6 +491,10 @@ class AudioTrack:
     label: str
     kind: str                      # "miot" | "usb"
     device_name: str | None = None  # 实际使用的 PortAudio 设备名
+    # 麦克风是怎么配上的："uid"（USB 身份精确匹配）/ "name"（名字）/
+    # "default"（内建机位兜到系统默认输入）。写进清单：同型号多机位下只有
+    # "uid" 才能保证没配串，事后能据此判断这路收音到底可不可信。
+    match_by: str | None = None
     wav: Path | None = None
     csv: Path | None = None
     sample_rate: int = 0
@@ -682,15 +695,24 @@ def _name_stem(name: str) -> str:
     return " ".join(s.split())
 
 
-def resolve_cam_mics(usb_indices: list, cam_names: list) -> dict:
+def resolve_cam_mics(usb_indices: list, cam_names: list,
+                     cam_uids: list | None = None) -> dict:
     """给每路 USB 摄像头配自带麦克风，**一个输入设备只能分给一路**。
 
-    返回 ``{摄像头索引: (PortAudio 设备号, 设备名) | None}``。
+    返回 ``{摄像头索引: (PortAudio 设备号, 设备名, 匹配依据) | None}``，匹配
+    依据取 ``"uid"`` / ``"name"`` / ``"default"``。
 
-    匹配策略：
-    1. 优先按名字匹配：同一硬件的视频端与音频端往往只差一个后缀
+    匹配策略按可靠程度从高到低：
+
+    1. **按 USB 身份精确匹配**（有 ``cam_uids`` 时）：视频端 uniqueID → USB
+       location → 序列号 → 含该序列号的音频设备，见 :mod:`mac_device_ids`。
+       只有这一步能分开**同型号的两台摄像头** —— 它们的视频端与音频端名字
+       完全一样，名字匹配可能两路交叉，而两路都有数据、标签也对，属于
+       静默错配。它同时能避开单台设备的同名歧义（实测 1080P USB Camera
+       的麦与扬声器在 PortAudio 里同名）。
+    2. 按名字匹配：同一硬件的视频端与音频端往往只差一个后缀
        （"1080P USB Camera" ↔ "1080P USB Camera-Audio"）。
-    2. 仅对**内建机位**回退到系统默认输入设备：内建镜头与内建麦有时压根不同名
+    3. 仅对**内建机位**回退到系统默认输入设备：内建镜头与内建麦有时压根不同名
        （"FaceTime HD Camera" ↔ "MacBook Pro Microphone"），名字匹配会把本可用的
        内建麦白白丢掉；而内建麦与内建镜头同属一台机器，归到该机位名下不算错标。
 
@@ -699,7 +721,7 @@ def resolve_cam_mics(usb_indices: list, cam_names: list) -> dict:
     后果：三路 wav 的 RMS(1564/1570/1564)、峰值(13840)与采样率(均 16kHz)完全一致，
     全部来自同一个 1080P USB Camera-Audio。
 
-    按**名字**而非索引匹配：PortAudio 的设备索引会因设备插拔、甚至同一台相机的
+    两种匹配都**不看 PortAudio 设备索引**：索引会因设备插拔、甚至同一台相机的
     视频被占用而变动（实测同一索引下一轮就变成其它设备，报 Invalid number of
     channels）。
     """
@@ -710,23 +732,40 @@ def resolve_cam_mics(usb_indices: list, cam_names: list) -> dict:
     devs = sd.query_devices()
     ins = [(i, d["name"]) for i, d in enumerate(devs)
            if d["max_input_channels"] > 0]
+    valid_in = {i for i, _ in ins}
     taken: set = set()
-    out: dict = {}
-    # 第一轮：名字匹配
+    out: dict = {i: None for i in usb_indices}
+    # 第一轮：按 USB 身份精确匹配（唯一能分开同型号两台的办法）
+    if cam_uids:
+        uid_of = {cam: (cam_uids[cam] if cam < len(cam_uids) else None)
+                  for cam in usb_indices}
+        try:
+            from mac_device_ids import mic_by_camera_uid
+            # 只交本次在录的机位：序列号撞车的判定要限在这些机位之间，
+            # 没在录的同型号设备不应该影响本次配对。
+            hits = mic_by_camera_uid([u for u in uid_of.values() if u])
+        except Exception:
+            hits = {}
+        for cam in usb_indices:
+            uid = uid_of[cam]
+            hit = hits.get(uid) if uid else None
+            # 再校一道 PortAudio 侧确实能输入：两套枚举之间设备可能刚好变动
+            if hit and hit[0] in valid_in and hit[0] not in taken:
+                out[cam] = (hit[0], hit[1], "uid")
+                taken.add(hit[0])
+    # 第二轮：名字匹配
     for cam in usb_indices:
+        if out[cam] is not None:
+            continue
         stem = _name_stem(cam_names[cam] if cam < len(cam_names) else "")
-        pick = None
-        pick_name = None
-        if stem:
-            for dev_i, dev_name in ins:
-                if dev_i not in taken and _name_stem(dev_name) == stem:
-                    pick = dev_i
-                    pick_name = dev_name
-                    break
-        out[cam] = (pick, pick_name) if pick is not None else None
-        if pick is not None:
-            taken.add(pick)
-    # 第二轮：只给**内建机位**兜底到系统默认输入设备（外置机位一律留空，见上）。
+        if not stem:
+            continue
+        for dev_i, dev_name in ins:
+            if dev_i not in taken and _name_stem(dev_name) == stem:
+                out[cam] = (dev_i, dev_name, "name")
+                taken.add(dev_i)
+                break
+    # 第三轮：只给**内建机位**兜底到系统默认输入设备（外置机位一律留空，见上）。
     builtin_unmatched = [
         cam for cam, dev in out.items()
         if dev is None and _is_builtin_camera(
@@ -739,7 +778,7 @@ def resolve_cam_mics(usb_indices: list, cam_names: list) -> dict:
         for dev_i, dev_name in ins:
             if dev_i == default_dev and dev_i not in taken:
                 # 默认输入设备只有一个，最多兜给一路，仍不破坏「一麦一路」。
-                out[builtin_unmatched[0]] = (dev_i, dev_name)
+                out[builtin_unmatched[0]] = (dev_i, dev_name, "default")
                 taken.add(dev_i)
                 break
     return out
@@ -752,7 +791,7 @@ class EarlyAudio:
     stop: threading.Event
     threads: list[threading.Thread]
     tracks: list[AudioTrack]
-    mic_of: dict[int, tuple[int, str] | None]
+    mic_of: dict[int, tuple[int, str, str] | None]
     active_cams: set[int]
 
 
@@ -773,18 +812,20 @@ def _start_usb_mic_capture(
     stop = threading.Event()
     threads: list = []
     tracks: list = []
-    names = usb_device_names()
-    mics = resolve_cam_mics(usb_indices, names)
+    names, uids = usb_device_entries()
+    mics = resolve_cam_mics(usb_indices, names, uids)
     startups: list[tuple[int, AudioTrack, threading.Event]] = []
     for idx in usb_indices:
         tr = AudioTrack(label=f"usb[{idx}] 麦克风", kind="usb")
         tracks.append(tr)
         mic_info = mics.get(idx)
         if mic_info is None:
-            tr.error = "无可用麦克风（未找到同名输入设备；仅内建机位回退到系统默认输入）"
+            tr.error = ("无可用麦克风（USB 身份与名字都没配上对应的输入设备；"
+                        "仅内建机位回退到系统默认输入）")
             continue
-        dev, dev_name = mic_info
+        dev, dev_name, match_by = mic_info
         tr.device_name = dev_name
+        tr.match_by = match_by
         startup_done = threading.Event()
         t = threading.Thread(target=_collect_mic_audio,
                              args=(dev, out_dir, f"usb{idx}", stop, tr),
@@ -822,11 +863,18 @@ def _start_usb_mic_capture(
     return EarlyAudio(stop, threads, tracks, mics, active_cams)
 
 
-def _discard_early_audio(early: EarlyAudio) -> None:
+def _discard_early_audio(early: EarlyAudio, reason: str | None = None) -> list:
     """停掉提前起的 USB 麦采集并清掉已落盘的文件（降级为无麦时用）。
 
     采集线程在 stop 后会排干队列并写 WAV/CSV，故必须先 join 再删文件。
+
+    返回被停掉的音轨（``reason`` 非空时会写进本来正常那几路的 ``error``）。
+    **调用方要把它们并进清单**：否则被降级停掉的机位在清单里凭空消失，
+    事后根本看不出这一路为何没有音频（实测踩过：三路只剩一路音频，
+    manifest 里毫无线索）。
     """
+    # 先记下本来正常的几路（停流后它们的 error 会被采集线程抹成无数据）
+    was_running = [tr for tr in early.tracks if tr.error is None]
     early.stop.set()
     for t in early.threads:
         t.join(timeout=5)
@@ -837,6 +885,143 @@ def _discard_early_audio(early: EarlyAudio) -> None:
                     p.unlink()
                 except OSError:
                     pass
+        # 文件已删，清掉引用与计数，免得清单指向不存在的 wav
+        tr.wav = tr.csv = None
+        tr.sample_rate = tr.samples = tr.packets = 0
+    # 本来正常那几路：停流后采集线程会因为一帧未收而把 error 写成
+    # 「麦克风无数据」（降级发生在放行前，门控未开、本就没数据）——
+    # 那是本次停麦造成的假象，得用真正的降级原因盖掉；而停麦前就已有的
+    # 错误（如“无可用麦克风”）是真实原因，不能动。
+    if reason:
+        for tr in was_running:
+            tr.error = reason
+    return list(early.tracks)
+
+
+# 降级停麦时给每路留的解释，跟清单里的 audio_downgrade 互相对应。
+_MIC_DROPPED_FMT = ("已被音频降级停用（触发：{trigger} 读不到首帧），"
+                    "原因详见清单 audio_downgrade")
+_MIC_ROLLBACK_FMT = ("降级回滚时停用：重起摄像头麦后 {broken} 反而准备失败，"
+                     "为保住视频放弃本路录音")
+
+
+def _resolve_mic_video_conflict(
+    usb_sources: list, conflict_failed: list, early_audio: EarlyAudio,
+    external_mic_cams: set, out_dir: Path, gate: threading.Event,
+) -> tuple:
+    """处理「摄像头读不到首帧」与「外置复合麦活跃」同时出现的冲突。
+
+    返回 ``(新的 early_audio, 未能起回的音轨, 降级记录 dict)``。
+
+    先停掉摄像头麦重试失败的机位，**再按重试结果反推麦到底是不是元凶**：
+
+    * 有机位因此恢复 → 坐实是 USB 麦流与同一集线器下多路视频冲突，外置麦
+      保持停用（只起回内建麦）。
+    * 一路都没恢复 → 麦是无辜的（多为摄像头卡死或 USB 带宽/供电问题），
+      把其余机位的麦**重新起回来**。早期版本在这里一停了之，会为了一路
+      跟麦无关的摄像头故障，白白牺牲另一路本来正常的录音。
+
+    重起外置复合麦必须先放掉该机位的视频：复合设备上视频在采集时开音频输入
+    会被 macOS 驳回（PortAudio -9986）。若重起后反而把本来正常的机位弄挂，
+    则回滚成不带摄像头麦的状态 —— 视频是主产物，不能为录音冒险。
+    """
+    trigger = ", ".join(r.label for _, r in conflict_failed)
+    stopped = [tr.label for tr in early_audio.tracks if tr.error is None]
+    print(f"[警告] {trigger} 在摄像头麦开流时读不到首帧，先停掉摄像头麦重试…",
+          file=sys.stderr)
+    dropped = _discard_early_audio(
+        early_audio, _MIC_DROPPED_FMT.format(trigger=trigger))
+
+    recovered: list = []
+    still_failed: list = []
+    for s, r in conflict_failed:
+        if s.cap is not None:
+            s.cap.release()
+            s.cap = None
+        try:
+            s.setup()
+        except Exception as e:
+            r.error = str(e)
+            still_failed.append(r.label)
+            print(f"[警告] {r.label} 停麦后仍准备失败：{e}", file=sys.stderr)
+            continue
+        r.error = None
+        r.extra.pop("setup_failure_stage", None)
+        r.extra["size"] = f"{s.actual_w}x{s.actual_h}"
+        recovered.append(r.label)
+
+    alive = [s.index for s, r in usb_sources if r.error is None]
+    if recovered:
+        verdict = "confirmed"
+        note = (f"停掉摄像头麦后 {', '.join(recovered)} 恢复出帧，确认是 USB 麦流与"
+                "同一集线器下多路视频冲突；本次外置摄像头麦全程停用，内建麦保留。")
+        keep = [i for i in alive if i not in external_mic_cams]
+    else:
+        verdict = "ruled_out"
+        note = (f"停掉摄像头麦后 {trigger} 仍读不到首帧，说明麦流不是原因"
+                "（多为摄像头卡死或 USB 带宽/供电问题，可重插该摄像头再试）；"
+                "其余机位的麦已重新起回。")
+        keep = alive
+
+    new_early = None
+    restarted: list = []
+    if keep:
+        if verdict == "ruled_out":
+            # 复合麦要在视频之前开，先把这些机位的视频放掉
+            for s, r in usb_sources:
+                if s.index in keep and s.cap is not None:
+                    s.cap.release()
+                    s.cap = None
+        try:
+            new_early = _start_usb_mic_capture(keep, out_dir, gate)
+            restarted = [tr.label for tr in new_early.tracks if tr.error is None]
+        except Exception as e:
+            print(f"[警告] 降级后重起麦克风失败：{e}", file=sys.stderr)
+        if verdict == "ruled_out":
+            for s, r in usb_sources:
+                if s.index in keep:
+                    _resetup(s, r)
+            broken = [r.label for s, r in usb_sources
+                      if s.index in keep and r.error is not None]
+            if broken and new_early is not None:
+                print(f"[警告] 重起摄像头麦后 {', '.join(broken)} 反而准备失败，"
+                      "回滚为不带摄像头麦…", file=sys.stderr)
+                dropped += _discard_early_audio(
+                    new_early, _MIC_ROLLBACK_FMT.format(broken=", ".join(broken)))
+                new_early = None
+                restarted = []
+                verdict = "ruled_out_rolled_back"
+                note += f" 但重起麦后 {', '.join(broken)} 准备失败，已回滚为仅录视频。"
+                for s, r in usb_sources:
+                    if s.index in keep and r.error is not None:
+                        _resetup(s, r)
+
+    info = {
+        "trigger": [r.label for _, r in conflict_failed],
+        "trigger_stage": "first_frame",
+        "mics_stopped": stopped,
+        "cams_recovered": recovered,
+        "cams_still_failed": still_failed,
+        "mics_restarted": restarted,
+        "verdict": verdict,
+        "note": note,
+    }
+    return new_early, dropped, info
+
+
+def _resetup(src, res) -> None:
+    """重新准备一路 USB 摄像头，成败写回 ``res``（降级流程专用）。"""
+    if src.cap is not None:
+        src.cap.release()
+        src.cap = None
+    try:
+        src.setup()
+    except Exception as e:
+        res.error = str(e)
+        return
+    res.error = None
+    res.extra.pop("setup_failure_stage", None)
+    res.extra["size"] = f"{src.actual_w}x{src.actual_h}"
 
 
 def start_audio_capture(
@@ -920,7 +1105,8 @@ def print_sources(cameras: list[dict], url: str) -> None:
 
 
 def build_manifest(results: list[Result], seconds: float,
-                   audio: list | None = None) -> dict:
+                   audio: list | None = None,
+                   audio_downgrade: dict | None = None) -> dict:
     """汇总清单：以最早起点为基准给出各源偏移，并附对齐用的 ffmpeg 提示。"""
     ok = [r for r in results if r.error is None and r.first_unix_ms is not None]
     ref = min((r.first_unix_ms for r in ok), default=None)
@@ -983,6 +1169,7 @@ def build_manifest(results: list[Result], seconds: float,
                 "label": a.label,
                 "kind": a.kind,
                 "device_name": a.device_name,
+                "match_by": a.match_by,
                 "file": a.wav.name if a.wav else None,
                 "timestamps": a.csv.name if a.csv else None,
                 "sample_rate": a.sample_rate or None,
@@ -1001,6 +1188,10 @@ def build_manifest(results: list[Result], seconds: float,
             "音频 ts 恒为 0（未填或哨兵值），所以**无法**用相机 PTS 做音视频桥接，"
             "只能靠主机墙钟对齐。"
         )
+    if audio_downgrade:
+        # 降级的完整经过：触发机位、停了哪几路麦、停麦后到底救回来没有。
+        # 没这些信息时，事后只能看到“某几路没音频”而无从判断原因。
+        manifest["audio_downgrade"] = audio_downgrade
     return manifest
 
 
@@ -1041,6 +1232,17 @@ def print_summary(manifest: dict) -> None:
             dev = f"（{a['device_name']}）" if a.get("device_name") else ""
             print(f"  ♫ {a['label']}{dev}：{Path(a['file']).name} "
                   f"{dur:.1f}s @ {a['sample_rate']}Hz{gap}")
+    dg = manifest.get("audio_downgrade")
+    if dg:
+        # 降级结论要当场就能看到：否则得翻清单才知道音频为何缺了。
+        print(f"\n  ⚠ 音频降级（{dg['verdict']}）：{dg['note']}")
+        print(f"      触发：{'、'.join(dg['trigger'])}读不到首帧"
+              f"；停麦：{'、'.join(dg['mics_stopped']) or '无'}")
+        if dg.get("cams_recovered"):
+            print(f"      停麦后恢复：{'、'.join(dg['cams_recovered'])}")
+        if dg.get("cams_still_failed"):
+            print(f"      停麦后仍失败：{'、'.join(dg['cams_still_failed'])}")
+        print(f"      重起回来的麦：{'、'.join(dg['mics_restarted']) or '无'}")
 
 
 # ─── 主流程 ──────────────────────────────────────────────────────────────────
@@ -1251,41 +1453,18 @@ def run(args) -> None:
     # 共存正常。故只停掉 USB 复合设备的麦并重试失败的摄像头，内建麦保留。
     # 只有「设备成功打开、首帧读不到」与已活跃的外置复合麦同时出现，才有证据
     # 指向本 PR 针对的 hub 冲突。无效索引、权限/占用导致的 open 失败不能误伤
-    # 其他正常机位的录音。
+    # 其他正常机位的录音。具体判定与降级/回滚看 :func:`_resolve_mic_video_conflict`。
     conflict_failed = [
         (s, r) for s, r in usb_sources
         if r.extra.get("setup_failure_stage") == "first_frame"
     ]
+    audio_downgrade: dict | None = None
+    dropped_tracks: list = []
     if conflict_failed and early_audio is not None and external_mic_cams:
-        print(
-            f"[警告] 有 {len(conflict_failed)} 路摄像头在摄像头麦克风开流时读不到首帧"
-            "（USB 麦流与同一集线器下的多路视频冲突），停掉摄像头麦重试，"
-            "本次降级为不带摄像头麦录制（内建麦保留）。",
-            file=sys.stderr,
+        early_audio, dropped_tracks, audio_downgrade = _resolve_mic_video_conflict(
+            usb_sources, conflict_failed, early_audio, external_mic_cams,
+            out_dir, audio_gate,
         )
-        _discard_early_audio(early_audio)
-        early_audio = None
-        for s, r in conflict_failed:
-            if s.cap is not None:
-                s.cap.release()
-                s.cap = None
-            try:
-                s.setup()
-            except Exception as e:
-                r.error = str(e)
-                print(f"[警告] {r.label} 停麦后仍准备失败：{e}", file=sys.stderr)
-                continue
-            r.error = None
-            r.extra.pop("setup_failure_stage", None)
-            r.extra["size"] = f"{s.actual_w}x{s.actual_h}"
-        # 只把非 USB 复合麦（如内建麦）重新起回来，与多路视频共存无碍（实测）。
-        keep = [s.index for s, r in usb_sources
-                if r.error is None and s.index not in external_mic_cams]
-        if keep:
-            try:
-                early_audio = _start_usb_mic_capture(keep, out_dir, audio_gate)
-            except Exception as e:
-                print(f"[警告] 降级后重起内建麦失败：{e}", file=sys.stderr)
 
     ready_usb = [(s, r) for s, r in usb_sources if r.error is None]
     n_parties = len(picked) + len(ready_usb)
@@ -1390,7 +1569,12 @@ def run(args) -> None:
             t.join(timeout=15)
     _restore(url, token, toggled)
 
-    manifest = build_manifest(results, seconds, a_tracks or None)
+    # 被降级停掉、最终也没起回来的机位：并进清单，别让它凭空消失
+    live_mics = {tr.label for tr in (a_tracks or [])}
+    a_tracks = list(a_tracks or []) + [
+        tr for tr in dropped_tracks if tr.label not in live_mics]
+
+    manifest = build_manifest(results, seconds, a_tracks or None, audio_downgrade)
     manifest_path = out_dir / "manifest.json"
     manifest_path.write_text(
         json.dumps(manifest, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"

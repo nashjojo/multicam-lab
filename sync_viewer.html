@@ -458,20 +458,25 @@ function syncUrl() {
   } catch (_) { /* file:// 等场景不支持，忽略 */ }
 }
 
+/** 该路在全局轴上占据的真实时长（秒）。
+ *
+ *  有逐帧 sidecar 时直接用帧时间戳跨度（精确），否则用 dur*ratio 折回真实时长。
+ *  不用清单里的 duration_wall_s：早期版本它由 perf_counter 掐出、含首帧 cap.read()
+ *  的等待开销，比帧跨度多 ~1s，照它画轴会在末尾留一段没有帧数据的空白。
+ *  `recalc()`（泳道宽度）与 `localTime()`（取帧位置）必须共用这一套口径，
+ *  两处各写一份迟早漂移。 */
+function realDur(s) {
+  if (s.frameTimes && s.frameTimes.length >= 2) {
+    return (s.frameTimes[s.frameTimes.length - 1] - s.frameTimes[0]) / 1000;
+  }
+  return s.dur * s.ratio;
+}
+
 /** 元数据到齐后重算全局时长、泳道跨度、单帧步长与刻度。 */
 function recalc() {
   const ok = SRC.filter((s) => !s.err && s.dur > 0);
   if (!ok.length) return;
   // 各路在全局轴上的占据区间：[offset, offset + realDur]
-  // 有逐帧 sidecar 时直接用帧时间戳跨度（精确），否则用 dur*ratio 折回真实时长。
-  // perf_counter 测的 duration_wall_s 含首帧 cap.read() 等待开销，比帧跨度多 ~1s，
-  // 会导致 timeline 末尾出现无帧数据的空白段。
-  function realDur(s) {
-    if (s.frameTimes && s.frameTimes.length >= 2) {
-      return (s.frameTimes[s.frameTimes.length - 1] - s.frameTimes[0]) / 1000;
-    }
-    return s.dur * s.ratio;
-  }
   total = Math.max(...ok.map((s) => s.offset + realDur(s)));
   $("tot").textContent = fmt(total);
   const maxFps = Math.max(...ok.map((s) => s.fpsAct || 30));
@@ -555,10 +560,6 @@ function localTime(s) {
   // 容差取该路一帧的时长：起点偏移只有几十毫秒时（本就是同步录制的常态），
   // 第 0 帧就是最接近的可用帧，不该把卡片判成"未开始"并压暗。
   const tol = 1 / (s.fpsAct || 20);
-  // 该路在全局轴上的实际时长：有 sidecar 时用帧跨度（精确），否则用 dur*ratio。
-  const rd = (s.frameTimes && s.frameTimes.length >= 2)
-    ? (s.frameTimes[s.frameTimes.length - 1] - s.frameTimes[0]) / 1000
-    : s.dur * s.ratio;
 
   // 优先走逐帧精确映射：把全局时刻换成主机墙钟，二分找最贴近的帧，
   // 再用 帧号/写入帧率 得到文件内位置。这样不依赖任何"平均帧率"假设。
@@ -566,9 +567,13 @@ function localTime(s) {
     const targetMs = refUnixMs + gt * 1000;
     const ft = s.frameTimes;
     if (targetMs < ft[0] - tol * 1000) return null;
-    const sourceEndMs = ft[0] + rd * 1000;
-    if (targetMs > sourceEndMs) return null;
-    if (targetMs > ft[ft.length - 1]) {
+    // 末尾同样要留一帧容差。realDur() 定的轴末尾理应正好落在 ft[-1] 上，但清单里
+    // start_offset_ms 按 0.1ms 取整，拖到最末端时 targetMs 会超出零点几毫秒 ——
+    // 卡容差为 0 就会在最后一瞬把该路判成“已结束”、末帧闪成压暗。
+    const ftEnd = ft[ft.length - 1];
+    if (targetMs > ftEnd + tol * 1000) return null;
+    if (targetMs > ftEnd) {
+      // 落在末尾容差区内：夹到最后一帧，保持画面。
       return Math.min(Math.max((ft.length - 1) / s.fpsWritten, 0),
                       Math.max(s.dur - 1e-3, 0));
     }

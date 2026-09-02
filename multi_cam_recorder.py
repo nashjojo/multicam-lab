@@ -427,17 +427,23 @@ class UsbSource:
         # ``setpts=PTS*ratio`` 校回，或直接用 sidecar 的逐帧时间戳。
         # 分子必须是 written_fps（文件真正用的帧率），用未取整的 self.fps 会造成
         # 随时长累积的时间轴偏移（实测：32s 处 0.5s）。
-        if frames and elapsed > 0:
-            measured = frames / elapsed
+        # 用帧 stamps 算时长：perf_counter 包含首帧 cap.read() 的等待开销，
+        # 会比实际帧跨度多 1-2s，导致 viewer timeline 超出帧数据范围。
+        if len(stamps) >= 2:
+            frame_span = stamps[-1] - stamps[0]
+        else:
+            frame_span = elapsed
+        if frames and frame_span > 0:
+            measured = frames / frame_span
             result.extra["fps_actual"] = round(measured, 2)
-            result.extra["duration_wall_s"] = round(elapsed, 3)
+            result.extra["duration_wall_s"] = round(frame_span, 3)
             ratio = written_fps / measured if measured else 1.0
             result.extra["playback_speed_ratio"] = round(ratio, 4)
             # 门槛取 3%：10s 素材上 3% 已是 0.3s 漂移，对多机对齐已经不容忽略。
             if abs(ratio - 1.0) > 0.03:
                 result.extra["warn"] = (
                     f"文件按 {written_fps}fps 写入但实际采集 {measured:.1f}fps，"
-                    f"回放速度偏差 {(ratio - 1) * 100:+.1f}%（{elapsed:.1f}s 录成 "
+                    f"回放速度偏差 {(ratio - 1) * 100:+.1f}%（{frame_span:.1f}s 录成 "
                     f"{frames / written_fps:.1f}s）；帧级对齐请用 sidecar 时间戳"
                 )
 
@@ -471,6 +477,7 @@ class AudioTrack:
 
     label: str
     kind: str                      # "miot" | "usb"
+    device_name: str | None = None  # 实际使用的 PortAudio 设备名
     wav: Path | None = None
     csv: Path | None = None
     sample_rate: int = 0
@@ -674,12 +681,13 @@ def _name_stem(name: str) -> str:
 def resolve_cam_mics(usb_indices: list, cam_names: list) -> dict:
     """给每路 USB 摄像头配自带麦克风，**一个输入设备只能分给一路**。
 
-    返回 ``{摄像头索引: PortAudio 设备号 | None}``。
+    返回 ``{摄像头索引: (PortAudio 设备号, 设备名) | None}``。
 
-    **不做「匹配不上就拿第一个 usb 输入设备」的兜底**：多机位时那会让几路悄悄
-    录同一支麦，却在清单里被标成各自机位的收音 —— 比没有音频更糟。实测过：
-    三路 wav 的 RMS(1564/1570/1564)、峰值(13840)与采样率(均 16kHz)完全一致，
-    全部来自同一个 1080P USB Camera-Audio。配不上就明确留空。
+    匹配策略：
+    1. 优先按名字匹配：同一硬件的视频端与音频端往往只差一个后缀
+       （"1080P USB Camera" ↔ "1080P USB Camera-Audio"）
+    2. 回退到系统默认输入设备：对于内置摄像头（如 FaceTime）或没有自带麦克风的
+       设备，使用系统默认输入设备作为回退。但需要确保不会多路共用同一个麦克风。
 
     按**名字**而非索引匹配：PortAudio 的设备索引会因设备插拔、甚至同一台相机的
     视频被占用而变动（实测同一索引下一轮就变成其它设备，报 Invalid number of
@@ -694,17 +702,31 @@ def resolve_cam_mics(usb_indices: list, cam_names: list) -> dict:
            if d["max_input_channels"] > 0]
     taken: set = set()
     out: dict = {}
+    # 第一轮：名字匹配
     for cam in usb_indices:
         stem = _name_stem(cam_names[cam] if cam < len(cam_names) else "")
         pick = None
+        pick_name = None
         if stem:
             for dev_i, dev_name in ins:
                 if dev_i not in taken and _name_stem(dev_name) == stem:
                     pick = dev_i
+                    pick_name = dev_name
                     break
-        out[cam] = pick
+        out[cam] = (pick, pick_name) if pick is not None else None
         if pick is not None:
             taken.add(pick)
+    # 第二轮：对于没有匹配到的摄像头，尝试使用系统默认输入设备
+    unmatched = [cam for cam, dev in out.items() if dev is None]
+    if unmatched:
+        default_dev = sd.default.device[0]  # 默认输入设备
+        if default_dev >= 0 and default_dev not in taken:
+            # 检查该设备是否在输入设备列表中
+            for dev_i, dev_name in ins:
+                if dev_i == default_dev:
+                    out[unmatched[0]] = (dev_i, dev_name)
+                    taken.add(dev_i)
+                    break
     return out
 
 
@@ -742,10 +764,12 @@ def _start_usb_mic_capture(
     for idx in usb_indices:
         tr = AudioTrack(label=f"usb[{idx}] 麦克风", kind="usb")
         tracks.append(tr)
-        dev = mics.get(idx)
-        if dev is None:
-            tr.error = "无自带麦克风（未找到同名输入设备；不再借用其它机位的麦）"
+        mic_info = mics.get(idx)
+        if mic_info is None:
+            tr.error = "无可用麦克风（未找到同名输入设备，且默认输入设备已被占用）"
             continue
+        dev, dev_name = mic_info
+        tr.device_name = dev_name
         startup_done = threading.Event()
         t = threading.Thread(target=_collect_mic_audio,
                              args=(dev, out_dir, f"usb{idx}", stop, tr),
@@ -943,6 +967,7 @@ def build_manifest(results: list[Result], seconds: float,
             {
                 "label": a.label,
                 "kind": a.kind,
+                "device_name": a.device_name,
                 "file": a.wav.name if a.wav else None,
                 "timestamps": a.csv.name if a.csv else None,
                 "sample_rate": a.sample_rate or None,
@@ -998,7 +1023,8 @@ def print_summary(manifest: dict) -> None:
         else:
             dur = (a["samples"] or 0) / (a["sample_rate"] or 1)
             gap = f"，丢包 {a['seq_gaps']} 处" if a.get("seq_gaps") else ""
-            print(f"  ♫ {a['label']}：{Path(a['file']).name} "
+            dev = f"（{a['device_name']}）" if a.get("device_name") else ""
+            print(f"  ♫ {a['label']}{dev}：{Path(a['file']).name} "
                   f"{dur:.1f}s @ {a['sample_rate']}Hz{gap}")
 
 

@@ -462,16 +462,24 @@ function syncUrl() {
 function recalc() {
   const ok = SRC.filter((s) => !s.err && s.dur > 0);
   if (!ok.length) return;
-  // 各路在全局轴上的占据区间：[offset, offset + dur*ratio]
-  // 乘 ratio 是把「文件时长」折回「真实时长」（文件放得快 → 真实更长）。
-  total = Math.max(...ok.map((s) => s.offset + s.dur * s.ratio));
+  // 各路在全局轴上的占据区间：[offset, offset + realDur]
+  // 有逐帧 sidecar 时直接用帧时间戳跨度（精确），否则用 dur*ratio 折回真实时长。
+  // perf_counter 测的 duration_wall_s 含首帧 cap.read() 等待开销，比帧跨度多 ~1s，
+  // 会导致 timeline 末尾出现无帧数据的空白段。
+  function realDur(s) {
+    if (s.frameTimes && s.frameTimes.length >= 2) {
+      return (s.frameTimes[s.frameTimes.length - 1] - s.frameTimes[0]) / 1000;
+    }
+    return s.dur * s.ratio;
+  }
+  total = Math.max(...ok.map((s) => s.offset + realDur(s)));
   $("tot").textContent = fmt(total);
   const maxFps = Math.max(...ok.map((s) => s.fpsAct || 30));
   stepSec = 1 / (maxFps || 30);
   ok.forEach((s) => {
     if (!s.span) return;
     s.span.style.left = (s.offset / total * 100) + "%";
-    s.span.style.width = (s.dur * s.ratio / total * 100) + "%";
+    s.span.style.width = (realDur(s) / total * 100) + "%";
   });
   drawRuler();
   // 元数据是逐路到的，total 会随之变大，所以 ?t= 要在**每次** recalc 重新应用（seek 内部
@@ -545,16 +553,25 @@ function syncAudio(hard) {
 /** 某路在全局时刻 gt 应处的文件内时间；null = 该路此刻没有画面。 */
 function localTime(s) {
   // 容差取该路一帧的时长：起点偏移只有几十毫秒时（本就是同步录制的常态），
-  // 第 0 帧就是最接近的可用帧，不该把卡片判成“未开始”并压暗。
+  // 第 0 帧就是最接近的可用帧，不该把卡片判成"未开始"并压暗。
   const tol = 1 / (s.fpsAct || 20);
+  // 该路在全局轴上的实际时长：有 sidecar 时用帧跨度（精确），否则用 dur*ratio。
+  const rd = (s.frameTimes && s.frameTimes.length >= 2)
+    ? (s.frameTimes[s.frameTimes.length - 1] - s.frameTimes[0]) / 1000
+    : s.dur * s.ratio;
 
   // 优先走逐帧精确映射：把全局时刻换成主机墙钟，二分找最贴近的帧，
-  // 再用 帧号/写入帧率 得到文件内位置。这样不依赖任何“平均帧率”假设。
+  // 再用 帧号/写入帧率 得到文件内位置。这样不依赖任何"平均帧率"假设。
   if (s.frameTimes && refUnixMs) {
     const targetMs = refUnixMs + gt * 1000;
     const ft = s.frameTimes;
     if (targetMs < ft[0] - tol * 1000) return null;
-    if (targetMs > ft[ft.length - 1] + tol * 1000) return null;
+    const sourceEndMs = ft[0] + rd * 1000;
+    if (targetMs > sourceEndMs) return null;
+    if (targetMs > ft[ft.length - 1]) {
+      return Math.min(Math.max((ft.length - 1) / s.fpsWritten, 0),
+                      Math.max(s.dur - 1e-3, 0));
+    }
     let lo = 0, hi = ft.length - 1;
     while (hi - lo > 1) {
       const mid = (lo + hi) >> 1;

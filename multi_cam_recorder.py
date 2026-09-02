@@ -1221,10 +1221,18 @@ def build_manifest(results: list[Result], seconds: float,
 
 def print_summary(manifest: dict) -> None:
     print("\n=== 录制结果 ===")
-    ok_rows = [s for s in manifest["sources"] if not s.get("error")]
+    # 「有产出」才算一路：没文件的不计入同录路数，也不能走下面的成功分支。
+    ok_rows = [s for s in manifest["sources"]
+               if not s.get("error") and s.get("file")]
     for s in manifest["sources"]:
         if s.get("error"):
             print(f"  ✗ {s['label']}：{s['error']}")
+            continue
+        if not s.get("file"):
+            # 既没 error 也没文件：正常流程不该出现，但录制线程卡死被超时
+            # 弃掉时就会。这里是最后一道防线 —— 摘要绝不能因为一路残缺就整个
+            # 抛栈，那会连带吞掉其它路的结论和后面的清单路径。
+            print(f"  ⚠ {s['label']}：无产出文件（未记录失败原因）")
             continue
         off = s.get("start_offset_ms")
         off_txt = f"起点 +{off:.0f}ms" if off is not None else "起点未知"
@@ -1521,7 +1529,10 @@ def run(args) -> None:
         rec_started.set()
 
     barrier = threading.Barrier(n_parties, action=_on_barrier_release)
-    threads: list[threading.Thread] = []
+    # 线程与它负责的 Result 成对存：超时放弃时要能把「还活着的线程」映回到
+    # 具体哪一路，给它补上失败原因（靠两个列表下标对应太脆：准备失败的源
+    # 只进 results 不起线程，两边长度并不一致）。
+    workers: list[tuple[threading.Thread, Result]] = []
     results: list[Result] = []
 
     for c in picked:
@@ -1538,7 +1549,7 @@ def run(args) -> None:
             args=(url, token, c, seconds, out_path, barrier, res),
             daemon=True,
         )
-        threads.append(t)
+        workers.append((t, res))
 
     for s, r in ready_usb:
         results.append(r)
@@ -1546,7 +1557,7 @@ def run(args) -> None:
         t = threading.Thread(
             target=s.run, args=(out_path, barrier, r), daemon=True
         )
-        threads.append(t)
+        workers.append((t, r))
 
     # 准备失败的 USB 源也要进清单（带 error），但不参与栅栏
     results.extend(r for _, r in usb_sources if r.error is not None)
@@ -1554,7 +1565,7 @@ def run(args) -> None:
     print("\n各路准备中（USB 预热后统一放行）…", flush=True)
     if args.stop_file:
         _start_stop_watcher(Path(args.stop_file))
-    for t in threads:
+    for t, _ in workers:
         t.start()
     # ⬇ 米家音频必须等栅栏放行后再起，不能提前：3 条 WS + opus 解码器
     # 同时初始化会把 USB 预热那 2.5s 的抓帧循环挤到极低（实测只剩 4fps），
@@ -1576,12 +1587,23 @@ def run(args) -> None:
     # 超时上限：时长 + 冷启/编码/落盘余量；线程内部自己也有超时。
     deadline = time.monotonic() + seconds + 40
     try:
-        for t in threads:
+        for t, _ in workers:
             t.join(timeout=max(1.0, deadline - time.monotonic()))
     except KeyboardInterrupt:
         print("\n收到 Ctrl+C，等各路收尾…")
-        for t in threads:
+        for t, _ in workers:
             t.join(timeout=5)
+
+    # 到这儿还活着的线程 = 那一路没能收尾（实测：iPhone 连续互通相机会在
+    # cap.read() 里无限阻塞，主线程只能超时弃它继续）。必须补一条 error：
+    # 否则 Result 停在 file=None/error=None 的半成品状态 —— 清单里看不出缘由，
+    # 摘要还会把它当成功路去取文件名而抛 TypeError（实测踩过）。
+    # 只在确实没产出时补：path 已落定说明帧已写完、文件可用，可能只是
+    # sidecar 还在收尾，那种情况报错反而会丢掉能用的素材。
+    for t, r in workers:
+        if t.is_alive() and r.error is None and r.path is None:
+            r.error = "录制线程超时未收尾（该路可能卡在读帧上），本段无产出"
+            print(f"[警告] {r.label}：{r.error}", file=sys.stderr)
 
     for s, _ in usb_sources:
         s.close()
@@ -1606,7 +1628,8 @@ def run(args) -> None:
     print_summary(manifest)
     print(f"\n清单（含逐源起点与偏移）：{manifest_path}")
 
-    if not [s for s in manifest["sources"] if not s.get("error")]:
+    if not [s for s in manifest["sources"]
+            if not s.get("error") and s.get("file")]:
         print("[错误] 所有源都失败了。", file=sys.stderr)
         sys.exit(EXIT_API)
 

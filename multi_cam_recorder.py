@@ -271,11 +271,13 @@ class UsbSetupError(RuntimeError):
 class UsbSource:
     """一路 USB 摄像头：预热排空缓冲 → 栅栏放行 → 按墙钟录到时长。"""
 
-    def __init__(self, index: int, width: int, height: int, seconds: float):
+    def __init__(self, index: int, width: int, height: int, seconds: float,
+                 fps_cap: float = 0.0):
         self.index = index
         self.width = width
         self.height = height
         self.seconds = seconds
+        self.fps_cap = fps_cap
         self.cap = None
         self.fps = 30.0
         self.actual_w = width
@@ -298,6 +300,12 @@ class UsbSource:
             )
         cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.width)
         cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.height)
+        # 帧率上限在分辨率之后下发：换格式会带出设备默认帧率，先设会被覆盖。
+        # 多机位的真实瓶颈是 USB 等时带宽而非画质 —— 实测一台默认按 60fps 出流的
+        # 相机会把同一条 USB 2.0 上行链路上的另一台挤到一帧都读不出（open 成功、
+        # read 全空），限到 30fps 后两台稳定共存。0 表示不限，用设备默认值。
+        if self.fps_cap > 0:
+            cap.set(cv2.CAP_PROP_FPS, self.fps_cap)
         ok, frame = cap.read()
         if not ok:
             cap.release()
@@ -370,6 +378,19 @@ class UsbSource:
         # 让回放时间轴死偏（实测踩过：26.40 取整成 26 但 ratio 用 26.40 算，
         # 32s 处就偏 0.5s，且偏的方向随“四舍/五入”翻转）。
         written_fps = max(1, int(round(self.fps)))
+        # ⬇ 实测值「高于但贴近」请求的帧率上限时，写入值用上限。
+        # 设备既然接了限速就不可能跑得比上限快，超出部分必然是测量噪声：
+        # 2.5s 预热里驱动偶尔连吐两帧就能把 30fps 抬到 30.5，一取整成 31，
+        # 文件凭空快 3.8%（实测：请求 30、真实采集 29.88、却写成 31）。
+        #
+        # 必须单向（只管 measured > cap），不能写成双向容差：实测**低于**上限
+        # 意味着相机压根儿达不到该帧率，此时往上拗成上限只会错得更多 —— 实测
+        # 踩过：内建相机只能跑 30fps，请求 31 时预热测得 30.15（落在 31 的 3%
+        # 内），双向版本就把文件写成 31fps、偏差 +3.6%，而诚实取整只有 +0.2%。
+        # 上界仍留 3%：偏得太多（如请求 30 却测得 60）说明设备没接受限速，那就
+        # 不能拿上限当真。
+        if 0 < self.fps_cap < self.fps <= self.fps_cap * 1.03:
+            written_fps = max(1, int(round(self.fps_cap)))
         writer, fourcc = open_writer(
             str(out_path), self.actual_w, self.actual_h, written_fps
         )
@@ -424,6 +445,9 @@ class UsbSource:
         result.fps = float(written_fps)
         result.extra["fps_written"] = written_fps
         result.extra["fps_prewarm_measured"] = round(self.fps, 2)
+        if self.fps_cap > 0:
+            # 记下来才看得懂「这台能跑 60 却只有 30」不是掉帧而是主动限速。
+            result.extra["fps_cap_requested"] = self.fps_cap
         result.extra["fourcc"] = fourcc
         result.extra["size"] = f"{self.actual_w}x{self.actual_h}"
         try:
@@ -1432,7 +1456,7 @@ def run(args) -> None:
     # ---- 准备 USB 源（打开设备、实测帧率）----
     usb_sources: list[tuple[UsbSource, Result]] = []
     for idx in usb_indices:
-        src = UsbSource(idx, args.width, args.height, seconds)
+        src = UsbSource(idx, args.width, args.height, seconds, args.usb_fps)
         names = usb_device_names()
         label = f"usb[{idx}] {names[idx] if idx < len(names) else ''}".strip()
         res = Result(kind="usb", label=label)
@@ -1637,6 +1661,13 @@ def main() -> None:
     p.add_argument("--width", type=int, default=1280, help="USB 请求宽度，默认 1280")
     p.add_argument("--height", type=int, default=720, help="USB 请求高度，默认 720")
     p.add_argument(
+        "--usb-fps",
+        type=float,
+        default=30.0,
+        help="USB 摄像头请求帧率上限，默认 30；0 表示不限、用设备默认值。"
+             "多路相机共用一条 USB 链路时，按 60fps 出流的相机会把别的机位挤到无画面",
+    )
+    p.add_argument(
         "--ensure-in-use",
         action="store_true",
         help="临时启用未启用感知的米家相机（录完关回）",
@@ -1662,6 +1693,8 @@ def main() -> None:
     p.add_argument("--token", help="Bearer Token，默认读 $MILOCO_HOME/config.json")
     args = p.parse_args()
 
+    if args.usb_fps < 0:
+        p.error("--usb-fps 不能为负（0 表示不限）")
     if args.warmup < 0:
         p.error("--warmup 不能为负")
     run(args)

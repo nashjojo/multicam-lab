@@ -338,6 +338,7 @@ def record_one(args, bg: Background, port: int, keys: RawKeys) -> Path | None:
 
     cmd = [sys.executable, str(RECORDER),
            "--seconds", str(args.seconds), "--out", str(out_root),
+           "--usb-fps", str(args.usb_fps),
            "--stop-file", str(stop_file)]
     cmd += source_args(args)
     if args.audio:
@@ -432,6 +433,9 @@ def main() -> None:
                    help="本机摄像头索引（`multi_cam_recorder.py --list` 可查）；可重复")
     p.add_argument("--usb-auto", action="store_true",
                    help="自动挑本机摄像头（外置 + 内置，跳过 iPhone/iPad 连续互通）")
+    p.add_argument("--usb-fps", type=float, default=30.0,
+                   help="USB 摄像头帧率上限，默认 30；0 表示不限。"
+                        "多路相机共用一条 USB 链路时，60fps 的相机会把别的机位挤到无画面")
     p.add_argument("--miot", dest="miot", action="store_true", default=None,
                    help="额外拉全部米家摄像头通道（需 miloco 后端可达）；默认不带")
     p.add_argument("--no-miot", dest="miot", action="store_false",

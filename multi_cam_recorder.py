@@ -229,6 +229,16 @@ def usb_device_names() -> list[str]:
 # 且手机在不在身边会改变整张索引表，写死的 --usb N 就指错机位。要用就显式指定。
 CONTINUITY_HINTS = ("iphone", "ipad", "desk view", "桌上视角")
 
+# macOS 内建摄像头的常见显示名。不能反过来靠音频端点名称里的 ``audio`` 判断
+# 外置复合设备：很多 UVC 摄像头的音频端只叫 ``USB Microphone``，甚至与视频端同名。
+BUILTIN_CAMERA_HINTS = ("facetime", "macbook", "built-in", "builtin", "内建")
+
+
+def _is_builtin_camera(name: str) -> bool:
+    """按摄像头端名称识别内建机位；未知设备按外置处理，降级时更安全。"""
+    low = name.strip().lower()
+    return any(hint in low for hint in BUILTIN_CAMERA_HINTS)
+
 
 def pick_usb_auto() -> list[int]:
     """自动挑本机摄像头：外置 USB 与内置一并带上，只跳过连续互通设备。"""
@@ -239,6 +249,14 @@ def pick_usb_auto() -> list[int]:
             continue
         out.append(i)
     return out
+
+
+class UsbSetupError(RuntimeError):
+    """USB 摄像头准备失败，并携带失败阶段供降级逻辑做因果判断。"""
+
+    def __init__(self, message: str, stage: str):
+        super().__init__(message)
+        self.stage = stage
 
 
 class UsbSource:
@@ -263,19 +281,21 @@ class UsbSource:
         cap = open_camera(self.index)
         if not cap.isOpened():
             cap.release()
-            raise RuntimeError(
+            raise UsbSetupError(
                 f"打不开 USB 摄像头 index={self.index}"
                 "（macOS 需在 系统设置→隐私与安全性→摄像头 给终端授权，"
-                "且设备未被其他应用占用）"
+                "且设备未被其他应用占用）",
+                stage="open",
             )
         cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.width)
         cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.height)
         ok, frame = cap.read()
         if not ok:
             cap.release()
-            raise RuntimeError(
+            raise UsbSetupError(
                 f"USB 摄像头 index={self.index} 能打开但读不到画面"
-                "（多半是权限未授予或被占用）"
+                "（多半是权限未授予、被占用或 USB 音视频复合设备冲突）",
+                stage="first_frame",
             )
         self.actual_h, self.actual_w = frame.shape[:2]
         # VideoWriter 要先知道帧率；很多 UVC 相机上报值不准，实测更可靠。
@@ -550,27 +570,62 @@ async def _collect_miot_audio(
 def _collect_mic_audio(
     dev: int, out_dir: Path, tag: str,
     stop: threading.Event, track: AudioTrack,
+    gate: threading.Event | None = None, preroll_s: float = 0.5,
+    startup_done: threading.Event | None = None,
 ) -> None:
-    """本机麦克风（USB 摄像头自带）→ WAV + 逐块时间戳。"""
+    """本机麦克风（USB 摄像头自带）→ WAV + 逐块时间戳。
+
+    流在视频前就得开着（见 :func:`_start_usb_mic_capture`），但数据只在 ``gate``
+    放行（栅栏释放）后才入文件；此前只滚动保留末段 ``preroll_s`` 秒，
+    放行时先冲进队列，保住视频起点对应的那点声音。``gate`` 为 None 则全程收录。
+    """
     import queue as _q
+    from collections import deque
 
     import numpy as np
     import sounddevice as sd
 
-    sr = int(sd.query_devices(dev)["default_samplerate"])
+    try:
+        sr = int(sd.query_devices(dev)["default_samplerate"])
+    except Exception as e:
+        track.error = f"{type(e).__name__}: {e}"
+        if startup_done is not None:
+            startup_done.set()
+        return
     q = _q.Queue()
+    # blocksize=1024，预卷容量按块数折算；至少留 1 块。
+    pre: deque = deque(maxlen=max(1, int(preroll_s * sr / 1024)))
+    flushed = False
 
     def cb(indata, frames, time_info, status):
-        q.put((time.time(), indata[:, 0].copy()))
+        nonlocal flushed
+        blk = (time.time(), indata[:, 0].copy())
+        if gate is None or gate.is_set():
+            if not flushed:
+                for p in pre:
+                    q.put(p)
+                pre.clear()
+                flushed = True
+            q.put(blk)
+        else:
+            pre.append(blk)
 
     try:
         with sd.InputStream(device=dev, channels=1, samplerate=sr,
                             dtype="float32", callback=cb, blocksize=1024):
+            # 只有 InputStream 已成功进入 active 状态才放行调用方去开视频。
+            # t.start() 本身不提供这个保证；缺少握手会让音视频开流顺序产生竞态。
+            if startup_done is not None:
+                startup_done.set()
             while not stop.is_set():
                 time.sleep(0.1)
     except Exception as e:
         track.error = f"{type(e).__name__}: {e}"
         return
+    finally:
+        # 失败也必须唤醒等待者；调用方通过 track.error 区分成功与失败。
+        if startup_done is not None:
+            startup_done.set()
     parts: list = []
     rows: list = []
     cum = 0
@@ -653,18 +708,115 @@ def resolve_cam_mics(usb_indices: list, cam_names: list) -> dict:
     return out
 
 
-def start_audio_capture(
-    url: str, token: str, picked: list, usb_indices: list,
-    out_dir: Path,
-) -> tuple:
-    """起所有音频采集线程，返回 ``(停止信号, 线程列表, 结果容器)``。
+@dataclass
+class EarlyAudio:
+    """视频开流前已启动的 USB 麦克风，以及一次解析得到的稳定设备映射。"""
 
-    **不参与视频的栅栏同起**：每个音频包自带主机时间戳，对齐靠时间戳而不靠
-    “同时开始”；提前开、滑后关反而能把视频窗口完整覆盖进去。
+    stop: threading.Event
+    threads: list[threading.Thread]
+    tracks: list[AudioTrack]
+    mic_of: dict[int, int | None]
+    active_cams: set[int]
+
+
+def _start_usb_mic_capture(
+    usb_indices: list, out_dir: Path, gate: threading.Event | None = None,
+) -> EarlyAudio:
+    """起 USB 自带麦克风并等到开流成功/失败后返回。
+
+    **必须在摄像头视频流活跃之前调用**：USB 摄像头是复合设备（视频与麦克风同属一个
+    USB 设备），视频在采集时开同一设备的音频输入流会被 macOS 拒绝，PortAudio 报
+    ``Internal PortAudio error [PaErrorCode -9986]``、CoreAudio 侧为 ``AUHAL err='35'``。
+
+    但反过来也有坑（见 :func:`_discard_early_audio` 处的降级逻辑）：麦流持续活跃时，
+    同一 USB 集线器下的第二支摄像头可能完全不出帧（实测与分辨率/压缩格式无关）。
+    故调用方需在摄像头准备失败时停麦降级。
+    对齐不靠「同时开始」而靠每个音频包的主机时间戳，提前开流没有副作用。
     """
     stop = threading.Event()
     threads: list = []
     tracks: list = []
+    names = usb_device_names()
+    mics = resolve_cam_mics(usb_indices, names)
+    startups: list[tuple[int, AudioTrack, threading.Event]] = []
+    for idx in usb_indices:
+        tr = AudioTrack(label=f"usb[{idx}] 麦克风", kind="usb")
+        tracks.append(tr)
+        dev = mics.get(idx)
+        if dev is None:
+            tr.error = "无自带麦克风（未找到同名输入设备；不再借用其它机位的麦）"
+            continue
+        startup_done = threading.Event()
+        t = threading.Thread(target=_collect_mic_audio,
+                             args=(dev, out_dir, f"usb{idx}", stop, tr),
+                             kwargs={"gate": gate, "startup_done": startup_done},
+                             daemon=True)
+        try:
+            t.start()
+        except Exception as e:
+            tr.error = f"{type(e).__name__}: {e}"
+            continue
+        threads.append(t)
+        startups.append((idx, tr, startup_done))
+
+    # 等所有 InputStream 明确 active 或失败，严格保证调用方随后打开视频时音频端
+    # 已经完成开流；不能只等线程启动。用总 deadline，避免多路设备串行放大超时。
+    deadline = time.monotonic() + 10.0
+    timed_out = False
+    for _, tr, done in startups:
+        if not done.wait(timeout=max(0.0, deadline - time.monotonic())):
+            tr.error = "麦克风开流超时（10s）"
+            timed_out = True
+    if timed_out:
+        # 不允许尚未确认状态的 PortAudio 线程在视频打开后才迟到开流。
+        stop.set()
+        for t in threads:
+            t.join(timeout=5)
+        if any(t.is_alive() for t in threads):
+            raise RuntimeError("USB 麦克风开流线程无法停止；为避免音视频设备竞态，取消录制")
+        return EarlyAudio(threading.Event(), [], tracks, mics, set())
+
+    active_cams = {
+        idx for idx, tr, _ in startups
+        if tr.error is None
+    }
+    return EarlyAudio(stop, threads, tracks, mics, active_cams)
+
+
+def _discard_early_audio(early: EarlyAudio) -> None:
+    """停掉提前起的 USB 麦采集并清掉已落盘的文件（降级为无麦时用）。
+
+    采集线程在 stop 后会排干队列并写 WAV/CSV，故必须先 join 再删文件。
+    """
+    early.stop.set()
+    for t in early.threads:
+        t.join(timeout=5)
+    for tr in early.tracks:
+        for p in (tr.wav, tr.csv):
+            if p is not None:
+                try:
+                    p.unlink()
+                except OSError:
+                    pass
+
+
+def start_audio_capture(
+    url: str, token: str, picked: list, out_dir: Path,
+    early: EarlyAudio | None,
+) -> tuple:
+    """起剩余音频采集线程（米家音频流），与早起的 USB 麦汇合后一起返回。
+    签名与返回值：``(停止信号, 线程列表, 全部结果容器)``。
+    ``early`` 是 :func:`_start_usb_mic_capture` 的返回值（可为 ``None``）。
+
+    **米家音频不参与视频的栅栏同起**：每个音频包自带主机时间戳，对齐靠时间戳而不靠
+    “同时开始”；提前开、滑后关反而能把视频窗口完整覆盖进去。
+    """
+    if early is not None:
+        stop, threads, tracks = early.stop, early.threads, early.tracks
+    else:
+        stop = threading.Event()
+        threads = []
+        tracks = []
     ws_base = url.replace("http://", "ws://").replace("https://", "wss://")
 
     jobs = []
@@ -693,20 +845,6 @@ def start_audio_capture(
         t.start()
         threads.append(t)
 
-    names = usb_device_names()
-    mics = resolve_cam_mics(usb_indices, names)
-    for idx in usb_indices:
-        tr = AudioTrack(label=f"usb[{idx}] 麦克风", kind="usb")
-        tracks.append(tr)
-        dev = mics.get(idx)
-        if dev is None:
-            tr.error = "无自带麦克风（未找到同名输入设备；不再借用其它机位的麦）"
-            continue
-        t = threading.Thread(target=_collect_mic_audio,
-                             args=(dev, out_dir, f"usb{idx}", stop, tr),
-                             daemon=True)
-        t.start()
-        threads.append(t)
     return stop, threads, tracks
 
 
@@ -1026,6 +1164,28 @@ def run(args) -> None:
                 f"或加 --ensure-in-use 由本工具临时启用。"
             )
 
+    # USB 自带麦克风必须在**视频流活跃之前**开：视频在采集时开同一复合设备的音频流会被
+    # macOS 拒绝（PortAudio -9986，实测必现）。只提前麦克风：初始化毫秒级，不会像米家
+    # WS + opus 那样拖累下面的预热测帧率。但反向也有坑：麦流活跃时同一 USB 集线器下的第二支
+    # 摄像头可能不出帧（实测与分辨率无关）—— 所以下面若摄像头准备失败，会停麦降级重试。
+    # 数据不会提前入文件：门控在栅栏放行时才开（见 audio_gate）。
+    audio_gate = threading.Event()
+    early_audio: EarlyAudio | None = None
+    external_mic_cams: set[int] = set()  # 有活跃自带麦的外置摄像头（冲突风险源）
+    if args.audio and usb_indices:
+        try:
+            early_audio = _start_usb_mic_capture(usb_indices, out_dir, audio_gate)
+            cam_names = usb_device_names()
+            external_mic_cams = {
+                idx for idx in early_audio.active_cams
+                if not _is_builtin_camera(
+                    cam_names[idx] if idx < len(cam_names) else ""
+                )
+            }
+        except Exception as e:
+            print(f"[警告] USB 麦克风采集启动失败，本次仅录视频：{e}",
+                  file=sys.stderr)
+
     # ---- 准备 USB 源（打开设备、实测帧率）----
     usb_sources: list[tuple[UsbSource, Result]] = []
     for idx in usb_indices:
@@ -1037,16 +1197,61 @@ def run(args) -> None:
             src.setup()
         except Exception as e:  # 打不开 / 无权限 / 被占用
             res.error = str(e)
+            res.extra["setup_failure_stage"] = getattr(e, "stage", "unknown")
             print(f"[警告] {label} 准备失败：{e}", file=sys.stderr)
             usb_sources.append((src, res))
             continue
         res.extra["size"] = f"{src.actual_w}x{src.actual_h}"
         usb_sources.append((src, res))
 
+    # ---- 降级：USB 复合设备的麦流可能挤掉同一集线器下的其它摄像头 ----
+    # 实测（两支 2MP USB Camera 接同一 hub）：麦流活跃时第二支摄像头完全不出帧，
+    # 与分辨率/压缩格式无关（非纯带宽问题）；而内建麦（不在外接 hub 上）与多路视频
+    # 共存正常。故只停掉 USB 复合设备的麦并重试失败的摄像头，内建麦保留。
+    # 只有「设备成功打开、首帧读不到」与已活跃的外置复合麦同时出现，才有证据
+    # 指向本 PR 针对的 hub 冲突。无效索引、权限/占用导致的 open 失败不能误伤
+    # 其他正常机位的录音。
+    conflict_failed = [
+        (s, r) for s, r in usb_sources
+        if r.extra.get("setup_failure_stage") == "first_frame"
+    ]
+    if conflict_failed and early_audio is not None and external_mic_cams:
+        print(
+            f"[警告] 有 {len(conflict_failed)} 路摄像头在摄像头麦克风开流时读不到首帧"
+            "（USB 麦流与同一集线器下的多路视频冲突），停掉摄像头麦重试，"
+            "本次降级为不带摄像头麦录制（内建麦保留）。",
+            file=sys.stderr,
+        )
+        _discard_early_audio(early_audio)
+        early_audio = None
+        for s, r in conflict_failed:
+            if s.cap is not None:
+                s.cap.release()
+                s.cap = None
+            try:
+                s.setup()
+            except Exception as e:
+                r.error = str(e)
+                print(f"[警告] {r.label} 停麦后仍准备失败：{e}", file=sys.stderr)
+                continue
+            r.error = None
+            r.extra.pop("setup_failure_stage", None)
+            r.extra["size"] = f"{s.actual_w}x{s.actual_h}"
+        # 只把非 USB 复合麦（如内建麦）重新起回来，与多路视频共存无碍（实测）。
+        keep = [s.index for s, r in usb_sources
+                if r.error is None and s.index not in external_mic_cams]
+        if keep:
+            try:
+                early_audio = _start_usb_mic_capture(keep, out_dir, audio_gate)
+            except Exception as e:
+                print(f"[警告] 降级后重起内建麦失败：{e}", file=sys.stderr)
+
     ready_usb = [(s, r) for s, r in usb_sources if r.error is None]
     n_parties = len(picked) + len(ready_usb)
     if n_parties == 0:
         print("[错误] 没有任何可用源。", file=sys.stderr)
+        if early_audio is not None:
+            _discard_early_audio(early_audio)
         _restore(url, token, toggled)
         sys.exit(EXIT_ARG)
 
@@ -1068,6 +1273,7 @@ def run(args) -> None:
 
     def _on_barrier_release() -> None:
         print("▶ 开始录制（栅栏已放行）", flush=True)
+        audio_gate.set()  # 早起的 USB 麦从此开始入文件（此前只滚动预卷）
         rec_started.set()
 
     barrier = threading.Barrier(n_parties, action=_on_barrier_release)
@@ -1106,17 +1312,18 @@ def run(args) -> None:
         _start_stop_watcher(Path(args.stop_file))
     for t in threads:
         t.start()
-    # ⬇ 音频必须等栅栏放行后再起，不能提前：3 条 WS + opus 解码器 + PortAudio
+    # ⬇ 米家音频必须等栅栏放行后再起，不能提前：3 条 WS + opus 解码器
     # 同时初始化会把 USB 预热那 2.5s 的抓帧循环挤到极低（实测只剩 4fps），
     # 而写入帧率就是拿预热值定的 —— 文件会被写成 4fps、回放慢 6 倍。
-    # 代价：音频少了开头约 0.3-0.5s 的前置覆盖，无碍（逐包时间戳自描述）。
+    # USB 麦克风已在预热前提前开流（见 early_audio），这里只汇合。
+    # 代价：米家音频少了开头约 0.3-0.5s 的前置覆盖，无碍（逐包时间戳自描述）。
     a_stop = a_threads = None
     a_tracks: list = []
-    if args.audio:
+    if args.audio or early_audio is not None:
         rec_started.wait(timeout=90)
         try:
             a_stop, a_threads, a_tracks = start_audio_capture(
-                url, token, picked, [s.index for s, _ in ready_usb], out_dir
+                url, token, picked, out_dir, early_audio
             )
             print(f"  音频采集已起（{len(a_tracks)} 路）", flush=True)
         except Exception as e:

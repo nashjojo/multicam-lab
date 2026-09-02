@@ -429,12 +429,16 @@ class UsbSource:
         # 随时长累积的时间轴偏移（实测：32s 处 0.5s）。
         # 用帧 stamps 算时长：perf_counter 包含首帧 cap.read() 的等待开销，
         # 会比实际帧跨度多 1-2s，导致 viewer timeline 超出帧数据范围。
+        # 算帧率要拿**间隔数**去除时长：N 个时间戳之间只有 N-1 个帧间隔，用 N 会
+        # 系统性偏高（30 帧时高 3.4%，正好顶穿下面 3% 的告警门槛；900 帧才 0.1%）。
         if len(stamps) >= 2:
             frame_span = stamps[-1] - stamps[0]
+            intervals = frames - 1
         else:
             frame_span = elapsed
-        if frames and frame_span > 0:
-            measured = frames / frame_span
+            intervals = frames
+        if intervals and frame_span > 0:
+            measured = intervals / frame_span
             result.extra["fps_actual"] = round(measured, 2)
             result.extra["duration_wall_s"] = round(frame_span, 3)
             ratio = written_fps / measured if measured else 1.0
@@ -685,9 +689,15 @@ def resolve_cam_mics(usb_indices: list, cam_names: list) -> dict:
 
     匹配策略：
     1. 优先按名字匹配：同一硬件的视频端与音频端往往只差一个后缀
-       （"1080P USB Camera" ↔ "1080P USB Camera-Audio"）
-    2. 回退到系统默认输入设备：对于内置摄像头（如 FaceTime）或没有自带麦克风的
-       设备，使用系统默认输入设备作为回退。但需要确保不会多路共用同一个麦克风。
+       （"1080P USB Camera" ↔ "1080P USB Camera-Audio"）。
+    2. 仅对**内建机位**回退到系统默认输入设备：内建镜头与内建麦有时压根不同名
+       （"FaceTime HD Camera" ↔ "MacBook Pro Microphone"），名字匹配会把本可用的
+       内建麦白白丢掉；而内建麦与内建镜头同属一台机器，归到该机位名下不算错标。
+
+    **外置相机配不上就明确留空，不做任何借用**：那会让清单里某个外置机位标着自己的
+    收音、实际录的却是别处的麦 —— 比没有音频更糟，事后无从分辨。实测过按名字借麦的
+    后果：三路 wav 的 RMS(1564/1570/1564)、峰值(13840)与采样率(均 16kHz)完全一致，
+    全部来自同一个 1080P USB Camera-Audio。
 
     按**名字**而非索引匹配：PortAudio 的设备索引会因设备插拔、甚至同一台相机的
     视频被占用而变动（实测同一索引下一轮就变成其它设备，报 Invalid number of
@@ -716,17 +726,22 @@ def resolve_cam_mics(usb_indices: list, cam_names: list) -> dict:
         out[cam] = (pick, pick_name) if pick is not None else None
         if pick is not None:
             taken.add(pick)
-    # 第二轮：对于没有匹配到的摄像头，尝试使用系统默认输入设备
-    unmatched = [cam for cam, dev in out.items() if dev is None]
-    if unmatched:
-        default_dev = sd.default.device[0]  # 默认输入设备
-        if default_dev >= 0 and default_dev not in taken:
-            # 检查该设备是否在输入设备列表中
-            for dev_i, dev_name in ins:
-                if dev_i == default_dev:
-                    out[unmatched[0]] = (dev_i, dev_name)
-                    taken.add(dev_i)
-                    break
+    # 第二轮：只给**内建机位**兜底到系统默认输入设备（外置机位一律留空，见上）。
+    builtin_unmatched = [
+        cam for cam, dev in out.items()
+        if dev is None and _is_builtin_camera(
+            cam_names[cam] if cam < len(cam_names) else "")
+    ]
+    if builtin_unmatched:
+        # 读 sd.default.device 恒返回 [输入, 输出] 二元组；无可用输入时该位为 -1，
+        # 与任何真实设备号都对不上，自然跳过。
+        default_dev = sd.default.device[0]
+        for dev_i, dev_name in ins:
+            if dev_i == default_dev and dev_i not in taken:
+                # 默认输入设备只有一个，最多兜给一路，仍不破坏「一麦一路」。
+                out[builtin_unmatched[0]] = (dev_i, dev_name)
+                taken.add(dev_i)
+                break
     return out
 
 
@@ -737,7 +752,7 @@ class EarlyAudio:
     stop: threading.Event
     threads: list[threading.Thread]
     tracks: list[AudioTrack]
-    mic_of: dict[int, int | None]
+    mic_of: dict[int, tuple[int, str] | None]
     active_cams: set[int]
 
 
@@ -766,7 +781,7 @@ def _start_usb_mic_capture(
         tracks.append(tr)
         mic_info = mics.get(idx)
         if mic_info is None:
-            tr.error = "无可用麦克风（未找到同名输入设备，且默认输入设备已被占用）"
+            tr.error = "无可用麦克风（未找到同名输入设备；仅内建机位回退到系统默认输入）"
             continue
         dev, dev_name = mic_info
         tr.device_name = dev_name
